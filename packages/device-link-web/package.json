@@ -24,12 +24,13 @@
     "@cindy/maker-shared": "workspace:*"
   },
   "devDependencies": {
+    "@cindy/device-link-relay": "workspace:*",
     "@types/node": "*",
+    "@types/ws": "^8.18.1",
     "esbuild": "^0.28.1",
+    "jsdom": "^29.1.1",
     "typescript": "^5.7.0",
     "vitest": "^3.2.4",
-    "@cindy/device-link-relay": "workspace:*",
-    "ws": "^8.18.3",
-    "@types/ws": "^8.18.1"
+    "ws": "^8.18.3"
   }
 }

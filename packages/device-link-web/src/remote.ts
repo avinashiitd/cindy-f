@@ -35,6 +35,30 @@ export interface PushEvent {
   payload: unknown;
 }
 
+export type AgentKindName = 'claude-code' | 'codex' | 'pi';
+
+/** `maker:provider:list` 里本页用到的字段(其余字段忽略)。 */
+export interface ProviderLike {
+  id: string;
+  name: string;
+  agents: AgentKindName[];
+  connected: boolean;
+  suspended?: boolean;
+  models: Partial<Record<AgentKindName, Array<{ id: string; name: string; efforts?: string[]; disabled?: boolean }>>>;
+}
+
+export interface CreateSessionInput {
+  id: string;
+  agentKind: AgentKindName;
+  workspaceKind: 'project' | 'dialogue';
+  model: string;
+  permissionMode: string;
+  fastMode: boolean;
+  effort?: string;
+  providerId?: string;
+  workingDir?: string;
+}
+
 export class RemoteError extends Error {
   constructor(readonly code: string, message: string) {
     super(message);
@@ -43,6 +67,7 @@ export class RemoteError extends Error {
 }
 
 const LIST_LIMIT = 100;
+const ONLINE_WAIT_MS = 15_000;
 
 /** 这个浏览器作为控制端对被控端声明的信息。不声明任何可选能力,被控端按最保守的旧格式回复。 */
 function controllerInfo(deviceName: string) {
@@ -58,7 +83,15 @@ export class RemoteApi {
     private readonly credential: string,
     private readonly deviceName: string,
     private readonly fetchFn: typeof fetch = (url, init) => fetch(url, init),
-  ) {}
+  ) {
+    // 页面刷新或断线后,被控端可能还按旧页面的可靠传输状态回复;本端链路未就绪时这些回复会被丢弃。
+    // 共享客户端为此提供通知,与手机一样收到后重建控制链路,被控端随即重放未确认的回复。
+    client.onReliableFrameBeforeLink((deviceId) => {
+      this.opened.delete(deviceId);
+      void this.openLink(deviceId).catch(() => undefined);
+      return true;
+    });
+  }
 
   /** 设备列表(REST):与官方中转同形,含在线状态与是否允许被控。 */
   async listDevices(): Promise<DeviceView[]> {
@@ -70,7 +103,13 @@ export class RemoteApi {
     return Array.isArray(body.devices) ? body.devices : [];
   }
 
+  /** 刚打开页面或刚断线重连时连接还没就绪:先等它在线,而不是立刻失败。 */
+  private async online(): Promise<void> {
+    if (this.client.getStatus() !== 'online') await this.client.waitUntilOnline(ONLINE_WAIT_MS);
+  }
+
   async invoke<T>(deviceId: string, channel: string, args: unknown[] = []): Promise<T> {
+    await this.online();
     const result = await this.client.invoke(deviceId, { channel, args });
     if (!result.ok) throw new RemoteError(result.error.code, result.error.message);
     return result.result as T;
@@ -79,6 +118,7 @@ export class RemoteApi {
   /** 进入实时操作:建立控制链路(被控电脑会显示「正在被控」)。同一台电脑只建一次。 */
   async openLink(deviceId: string): Promise<void> {
     if (this.opened.has(deviceId)) return;
+    await this.online();
     await this.client.openLink(deviceId, controllerInfo(this.deviceName));
     this.opened.add(deviceId);
   }
@@ -148,6 +188,48 @@ export class RemoteApi {
       },
     };
     return this.invoke(deviceId, 'maker:input:enqueue', [session.id, item, { sendAtMs: now.getTime() }]);
+  }
+
+  // ── 新建任务与运行设置 ────────────────────────────────────────────────────
+  listProviders(deviceId: string): Promise<{ providers: ProviderLike[] }> {
+    return this.invoke(deviceId, 'maker:provider:list', [{ capabilities: [] }]);
+  }
+
+  listAvailableAgents(deviceId: string): Promise<AgentKindName[]> {
+    return this.invoke(deviceId, 'maker:list-available-agents', []);
+  }
+
+  recentWorkdirs(deviceId: string): Promise<Array<{ path: string }>> {
+    return this.invoke(deviceId, 'local-db:recent-workdirs:list', []);
+  }
+
+  createSession(deviceId: string, options: CreateSessionInput): Promise<{ sessionId: string; workDir?: string | null }> {
+    return this.invoke(deviceId, 'maker:create-session', [options]);
+  }
+
+  setModel(deviceId: string, sessionId: string, model: string, providerId: string | null): Promise<unknown> {
+    return this.invoke(deviceId, 'maker:set-model', providerId ? [sessionId, model, providerId] : [sessionId, model]);
+  }
+
+  setEffort(deviceId: string, sessionId: string, effort: string): Promise<unknown> {
+    return this.invoke(deviceId, 'maker:set-effort', [sessionId, effort]);
+  }
+
+  setPermissionMode(deviceId: string, sessionId: string, mode: string): Promise<unknown> {
+    return this.invoke(deviceId, 'maker:set-permission-mode', [sessionId, mode]);
+  }
+
+  /** 回答 Agent 的提问:多选答案是标签数组的 JSON,与手机、桌面一致。 */
+  answerQuestions(deviceId: string, requestId: string, answers: Record<string, string>): Promise<unknown> {
+    return this.invoke(deviceId, 'maker:resolve-interaction', [requestId, { kind: 'ask_user_question', answers }]);
+  }
+
+  resolvePlan(deviceId: string, requestId: string, approved: boolean, plan: string, feedback?: string): Promise<unknown> {
+    const reason = feedback?.trim() || undefined;
+    return this.invoke(deviceId, 'maker:resolve-interaction', [requestId, {
+      kind: 'plan_review', behavior: approved ? 'allow' : 'deny',
+      editedPlan: approved ? plan : undefined, reason: approved ? undefined : reason,
+    }]);
   }
 
   /** 被控端转发来的 push 事件(`maker:event`、`local-db:messages:created` 等)。 */

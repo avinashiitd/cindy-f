@@ -197,6 +197,28 @@ describe('browser control end to end', () => {
     expect(JSON.parse(item.persistedContent)).toEqual({ text: 'run the tests', images: [], files: [] });
     expect(typeof opts.sendAtMs).toBe('number');
     expect(byChannel('maker:input:stop')[0].args).toEqual(['s1', {}]);
+
+    // 新建任务与运行设置:wire 与手机一致。
+    await api.createSession(OWNER_DEVICE, { id: 'n1', agentKind: 'codex', workspaceKind: 'project', model: 'gpt', providerId: 'oa', permissionMode: 'plan', fastMode: false, workingDir: '/repo' });
+    await api.setModel(OWNER_DEVICE, 's1', 'opus', 'anthropic');
+    await api.setPermissionMode(OWNER_DEVICE, 's1', 'acceptEdits');
+    await api.answerQuestions(OWNER_DEVICE, 'q1', { 'Which DB?': 'postgres' });
+    await api.resolvePlan(OWNER_DEVICE, 'p1', false, '# plan', '  shorter please ');
+    expect(byChannel('maker:create-session')[0].args[0]).toMatchObject({ id: 'n1', agentKind: 'codex', model: 'gpt', providerId: 'oa', workingDir: '/repo' });
+    expect(byChannel('maker:set-model')[0].args).toEqual(['s1', 'opus', 'anthropic']);
+    expect(byChannel('maker:set-permission-mode')[0].args).toEqual(['s1', 'acceptEdits']);
+    const decisions = byChannel('maker:resolve-interaction').map((call) => call.args);
+    expect(decisions).toContainEqual(['q1', { kind: 'ask_user_question', answers: { 'Which DB?': 'postgres' } }]);
+    expect(decisions).toContainEqual(['p1', { kind: 'plan_review', behavior: 'deny', editedPlan: undefined, reason: 'shorter please' }]);
+
+    // 刷新页面 = 同一浏览器身份的新连接。被控端仍按旧连接的可靠传输回复;
+    // 新页面必须重建控制链路,否则回复被丢弃、列表一直加载不出来(曾经的缺陷)。
+    connection.stop();
+    const reloaded = createWebConnection(profile, { createWebSocket: browserWsFactory(globalThis.WebSocket as never) });
+    cleanups.push(() => reloaded.stop());
+    const reloadedApi = new RemoteApi(reloaded.client, profile.baseUrl, profile.credential, profile.deviceName);
+    const again = await reloadedApi.listSessions(OWNER_DEVICE);
+    expect(again.map((s) => s.id)).toEqual(['s1']);
   }, 30_000);
 
   it('rejects a browser handshake with the wrong credential or without the version marker', async () => {

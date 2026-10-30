@@ -9,9 +9,11 @@ import { webRelayAuthCrypto } from './crypto';
 import { h, replaceChildren } from './dom';
 import { pickStrings, type Strings } from './i18n';
 import { joinRelay, parseJoinInput } from './join';
+import { renderMarkdown } from './markdown';
 import { toDisplayMessages, type RemoteMessageRow } from './messages';
+import { agentKindOf, findModelOption, modelKey, modelOptions, needsFullAccessConfirmation, PERMISSION_MODES } from './models';
 import { clearProfile, loadProfile, saveProfile, type WebRelayProfile } from './profile';
-import { RemoteApi, RemoteError, type PendingInteraction, type RemoteSessionRow } from './remote';
+import { RemoteApi, RemoteError, type AgentKindName, type PendingInteraction, type ProviderLike, type RemoteSessionRow } from './remote';
 import { DEFAULT_DESKTOP_PREFERENCES, WebDesktopController, type DesktopPreferences, type DesktopSnapshot } from './desktop';
 
 const REFRESH_DEBOUNCE_MS = 300;
@@ -300,7 +302,9 @@ export function mountApp(root: HTMLElement): void {
 
     const paintList = () => replaceChildren(listEl,
       h('div', { class: 'row between' }, h('h2', { class: 'side-title' }, t.tasks),
-        h('button', { class: 'btn ghost', onclick: () => void load() }, t.refresh)),
+        h('div', { class: 'row' },
+          h('button', { class: 'btn ghost', onclick: () => void load() }, t.refresh),
+          h('button', { class: 'btn primary', onclick: () => void showNewTask() }, t.newTask))),
       failed ? h('p', { class: 'note error' }, t.loadFailed) : null,
       !failed && sessions.length === 0 ? h('p', { class: 'note' }, t.noTasks) : null,
       h('ul', { class: 'list' }, ...sessions.map((session) => h('li', {},
@@ -315,6 +319,71 @@ export function mountApp(root: HTMLElement): void {
       if (alive) paintList();
     };
     const schedule = () => { clearTimeout(timer); timer = setTimeout(() => void load(), REFRESH_DEBOUNCE_MS); };
+
+    /** 新建任务:选 Agent、模型、工作目录、权限,写下第一条消息,创建后直接发送。 */
+    const showNewTask = async () => {
+      if (!api) return;
+      chat?.dispose();
+      chat = null;
+      activeId = null;
+      paintList();
+      const [agentsRaw, providersRaw, workdirsRaw] = await Promise.all([
+        api.listAvailableAgents(device.deviceId).catch(() => ['claude-code'] as AgentKindName[]),
+        api.listProviders(device.deviceId).catch(() => ({ providers: [] as ProviderLike[] })),
+        api.recentWorkdirs(device.deviceId).catch(() => [] as Array<{ path: string }>),
+      ]);
+      if (!alive) return;
+      const agents = (Array.isArray(agentsRaw) && agentsRaw.length ? agentsRaw : ['claude-code']) as AgentKindName[];
+      const agentLabel: Record<AgentKindName, string> = { 'claude-code': 'Claude Code', codex: 'Codex', pi: 'Pi' };
+      const agentSelect = h('select', { id: 'nt-agent', 'aria-label': t.newTaskAgent }, ...agents.map((a) => h('option', { value: a }, agentLabel[a] ?? a)));
+      const modelSelect = h('select', { id: 'nt-model', 'aria-label': t.newTaskModel });
+      const folder = h('input', { id: 'nt-folder', type: 'text', list: 'nt-folders', placeholder: t.newTaskFolderHint, autocomplete: 'off', spellcheck: false });
+      const datalist = h('datalist', { id: 'nt-folders' }, ...workdirsRaw.slice(0, 30).map((w) => h('option', { value: w.path })));
+      if (workdirsRaw[0]) folder.value = workdirsRaw[0].path;
+      const permission = h('select', { id: 'nt-permission', 'aria-label': t.newTaskPermission }, ...PERMISSION_MODES.map((m) => h('option', { value: m }, t.permissionModes[m])));
+      const prompt = h('textarea', { id: 'nt-prompt', rows: 5, placeholder: t.newTaskPrompt });
+      const message = h('p', { class: 'note', role: 'status' });
+      const create = h('button', { class: 'btn primary', type: 'button' }, t.newTaskCreate);
+      const fillModels = () => {
+        const options = modelOptions(providersRaw.providers, agentSelect.value as AgentKindName);
+        replaceChildren(modelSelect, ...options.map((o) => h('option', { value: o.key }, options.some((x) => x !== o && x.modelId === o.modelId) ? `${o.label} · ${o.providerName}` : o.label)));
+        message.textContent = options.length ? '' : t.newTaskNoModels;
+        create.disabled = options.length === 0;
+      };
+      agentSelect.addEventListener('change', fillModels);
+      fillModels();
+      create.addEventListener('click', async () => {
+        const options = modelOptions(providersRaw.providers, agentSelect.value as AgentKindName);
+        const model = options.find((o) => o.key === modelSelect.value);
+        const text = prompt.value.trim();
+        const workingDir = folder.value.trim();
+        if (!model || !text || !workingDir) return;
+        create.disabled = true;
+        try {
+          const id = newClientId();
+          if (permission.value === 'bypassPermissions' && !window.confirm(t.fullAccessConfirm)) { create.disabled = false; return; }
+          await api!.createSession(device.deviceId, {
+            id, agentKind: agentSelect.value as AgentKindName, workspaceKind: 'project', model: model.modelId, providerId: model.providerId,
+            permissionMode: permission.value, fastMode: false, workingDir,
+          });
+          const created = await api!.getSession(device.deviceId, id);
+          await api!.sendText(device.deviceId, created, text, newClientId());
+          await load();
+          if (alive) openChat(created);
+        } catch (e) {
+          message.className = 'note error';
+          message.textContent = t.newTaskFailed + (e instanceof Error ? e.message : '');
+          create.disabled = false;
+        }
+      });
+      replaceChildren(chatEl, h('div', { class: 'chat newtask' }, h('h1', {}, t.newTask),
+        h('label', { for: 'nt-agent' }, t.newTaskAgent), agentSelect,
+        h('label', { for: 'nt-model' }, t.newTaskModel), modelSelect,
+        h('label', { for: 'nt-folder' }, t.newTaskFolder), folder, datalist,
+        h('label', { for: 'nt-permission' }, t.newTaskPermission), permission,
+        h('label', { for: 'nt-prompt' }, t.newTaskPrompt), prompt,
+        h('div', { class: 'row' }, create), message));
+    };
 
     const openChat = (session: RemoteSessionRow) => {
       chat?.dispose();
@@ -353,6 +422,42 @@ export function mountApp(root: HTMLElement): void {
     const runBadge = h('span', { class: 'pill ok' }, t.running);
     const stopButton = h('button', { class: 'btn', onclick: () => api && void api.stop(device.deviceId, session.id).then(load, load) }, t.stop);
     const titleEl = h('h1', {}, session.title || session.id);
+    let providers: ProviderLike[] = [];
+    const controls = h('div', { class: 'row controls' });
+    const setting = async (action: () => Promise<unknown>) => {
+      try { await action(); error = ''; } catch (e) { error = t.settingFailed + (e instanceof Error ? e.message : ''); }
+      await load();
+    };
+    const paintControls = () => {
+      const options = modelOptions(providers, agentKindOf(session.agentKind));
+      const current = findModelOption(options, session.model, session.providerId);
+      const modelSelect = h('select', { 'aria-label': t.newTaskModel },
+        ...(current ? [] : [h('option', { value: '' }, session.model)]),
+        ...options.map((o) => h('option', { value: o.key }, options.some((x) => x !== o && x.modelId === o.modelId) ? `${o.label} · ${o.providerName}` : o.label)));
+      modelSelect.value = current?.key ?? '';
+      modelSelect.addEventListener('change', () => {
+        const next = options.find((o) => o.key === modelSelect.value);
+        if (next && api) void setting(() => api!.setModel(device.deviceId, session.id, next.modelId, next.providerId));
+      });
+      const efforts = current?.efforts ?? [];
+      const effortSelect = efforts.length ? h('select', { 'aria-label': t.effort }, ...efforts.map((e) => h('option', { value: e }, e))) : null;
+      if (effortSelect) {
+        effortSelect.value = efforts.includes(session.effort) ? session.effort : efforts[0];
+        effortSelect.addEventListener('change', () => api && void setting(() => api!.setEffort(device.deviceId, session.id, effortSelect.value)));
+      }
+      const permissionSelect = h('select', { 'aria-label': t.newTaskPermission },
+        ...PERMISSION_MODES.map((m) => h('option', { value: m }, t.permissionModes[m])));
+      permissionSelect.value = (PERMISSION_MODES as readonly string[]).includes(session.permissionMode) ? session.permissionMode : 'ask';
+      permissionSelect.addEventListener('change', () => {
+        const next = permissionSelect.value;
+        if (needsFullAccessConfirmation(session.permissionMode, next) && !window.confirm(t.fullAccessConfirm)) {
+          permissionSelect.value = session.permissionMode;
+          return;
+        }
+        if (api) void setting(() => api!.setPermissionMode(device.deviceId, session.id, next));
+      });
+      replaceChildren(controls, modelSelect, effortSelect, permissionSelect);
+    };
 
     const load = async () => {
       if (!api) return;
@@ -363,6 +468,7 @@ export function mountApp(root: HTMLElement): void {
           api.listPendingInteractions(device.deviceId, session.id).catch(() => [] as PendingInteraction[]),
           api.invoke<Array<{ sessionId: string; isTurnRunning?: boolean }>>(device.deviceId, 'maker:list-active').catch(() => []),
         ]);
+        if (!providers.length) providers = (await api.listProviders(device.deviceId).catch(() => ({ providers: [] as ProviderLike[] }))).providers;
         session = fresh; rows = messages; interactions = pending;
         running = active.some((item) => item.sessionId === session.id && item.isTurnRunning);
         error = '';
@@ -376,6 +482,55 @@ export function mountApp(root: HTMLElement): void {
       try { await api.resolvePermission(device.deviceId, request.requestId, behavior); } catch (e) { error = t.sendFailed + (e instanceof Error ? e.message : ''); }
       await load();
     };
+    /** Agent 的提问:每题单选 / 多选(可加自己的回答);多选答案是标签数组的 JSON。 */
+    const askCard = (request: PendingInteraction['request']): HTMLElement => {
+      const questions = Array.isArray(request.questions) ? request.questions as Array<{ question?: string; header?: string; options?: Array<{ label: string; description?: string }>; multiSelect?: boolean }> : [];
+      const picked = new Map<string, Set<string>>();
+      const custom = new Map<string, HTMLInputElement>();
+      const blocks = questions.filter((q) => typeof q.question === 'string').map((q) => {
+        const key = q.question!;
+        const chosen = new Set<string>();
+        picked.set(key, chosen);
+        const free = h('input', { type: 'text', placeholder: t.askCustom });
+        custom.set(key, free);
+        return h('fieldset', { class: 'ask' },
+          h('legend', {}, q.header ? `${q.header}: ${q.question}` : q.question),
+          ...(q.options ?? []).map((option) => h('label', { class: 'choice' },
+            h('input', { type: q.multiSelect ? 'checkbox' : 'radio', name: `ask-${key}`, onchange: (e: Event) => {
+              const on = (e.target as HTMLInputElement).checked;
+              if (!q.multiSelect) { chosen.clear(); free.value = ''; }
+              if (on) chosen.add(option.label); else chosen.delete(option.label);
+            } }),
+            h('span', {}, option.label, option.description ? h('span', { class: 'sub' }, ` — ${option.description}`) : null))),
+          free);
+      });
+      const submit = async () => {
+        if (!api || typeof request.requestId !== 'string') return;
+        const answers: Record<string, string> = {};
+        for (const q of questions) {
+          if (typeof q.question !== 'string') continue;
+          const labels = [...(picked.get(q.question) ?? [])];
+          const typed = custom.get(q.question)?.value.trim() ?? '';
+          if (q.multiSelect) { if (typed) labels.push(typed); if (labels.length) answers[q.question] = JSON.stringify(labels); }
+          else if (typed || labels[0]) answers[q.question] = typed || labels[0];
+        }
+        try { await api.answerQuestions(device.deviceId, request.requestId, answers); } catch (e) { error = t.sendFailed + (e instanceof Error ? e.message : ''); }
+        await load();
+      };
+      return h('div', { class: 'card' }, ...blocks, h('div', { class: 'row' }, h('button', { class: 'btn primary', onclick: () => void submit() }, t.askQuestionSubmit)));
+    };
+    /** 计划审阅:批准(原样采用计划)或要求修改(附意见)。 */
+    const planCard = (request: PendingInteraction['request']): HTMLElement => {
+      const plan = typeof request.plan === 'string' ? request.plan : '';
+      const feedback = h('textarea', { rows: 2, placeholder: t.planFeedback });
+      const decide = async (approved: boolean) => {
+        if (!api || typeof request.requestId !== 'string') return;
+        try { await api.resolvePlan(device.deviceId, request.requestId, approved, plan, feedback.value); } catch (e) { error = t.sendFailed + (e instanceof Error ? e.message : ''); }
+        await load();
+      };
+      return h('div', { class: 'card' }, h('strong', {}, t.planReviewTitle), h('div', { class: 'md plan' }, renderMarkdown(plan)), feedback,
+        h('div', { class: 'row' }, h('button', { class: 'btn primary', onclick: () => void decide(true) }, t.planApprove), h('button', { class: 'btn', onclick: () => void decide(false) }, t.planReject)));
+    };
     const send = async () => {
       const text = input.value.trim();
       if (!text || sending || !api) return;
@@ -388,9 +543,14 @@ export function mountApp(root: HTMLElement): void {
     const paint = () => {
       const stick = log.scrollHeight - log.scrollTop - log.clientHeight < 80;
       titleEl.textContent = session.title || session.id;
+      paintControls();
       replaceChildren(log, ...toDisplayMessages(rows).map((message) =>
         h('div', { class: `msg ${message.kind}` },
-          message.kind === 'tool' ? h('span', { class: 'pill muted' }, `${t.tool}: ${message.text}`) : h('div', { class: 'bubble' }, message.text))));
+          message.kind === 'tool'
+            ? h('span', { class: 'pill muted tool' }, `${t.tool}: ${message.text}${message.detail ? ` · ${message.detail}` : ''}`)
+            : message.kind === 'assistant'
+              ? h('div', { class: 'bubble md' }, renderMarkdown(message.text))
+              : h('div', { class: 'bubble' }, message.text))));
       if (stick) log.scrollTop = log.scrollHeight;
       replaceChildren(side,
         ...interactions.map((item) => {
@@ -404,6 +564,8 @@ export function mountApp(root: HTMLElement): void {
                 h('button', { class: 'btn primary', onclick: () => void respond(request, 'allow') }, t.allow),
                 h('button', { class: 'btn', onclick: () => void respond(request, 'deny') }, t.deny)));
           }
+          if (request.kind === 'ask_user_question') return askCard(request);
+          if (request.kind === 'plan_review') return planCard(request);
           return h('div', { class: 'card' }, h('p', {}, t.unsupportedInteraction));
         }),
         error ? h('p', { class: 'note error' }, error) : null);
@@ -418,7 +580,7 @@ export function mountApp(root: HTMLElement): void {
     });
     replaceChildren(container, h('div', { class: 'chat' },
       h('div', { class: 'row between' }, titleEl, h('div', { class: 'row' }, runBadge, stopButton)),
-      log, side,
+      controls, log, side,
       h('div', { class: 'row composer-row' }, input, h('button', { class: 'btn primary', onclick: () => void send() }, t.send))));
     paint();
     void (async () => {

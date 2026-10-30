@@ -143,3 +143,32 @@ textarea, input[type=text], input:not([type]) {
   .workspace { grid-template-columns: 200px minmax(0, 1fr); }
   .split { grid-template-columns: 240px minmax(0, 1fr); }
 }
+
+/* 任务设置、新建任务、提问与计划卡片、Markdown 正文 */
+.controls { flex-wrap: wrap; }
+.controls select, .newtask select, .newtask input, .ask input[type=text] {
+  font: inherit; color: inherit; background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 6px 10px; max-width: 100%; }
+.newtask { max-width: 640px; overflow-y: auto; }
+.newtask label { margin-top: 8px; }
+.ask { border: 1px solid var(--border); border-radius: 12px; padding: 8px 12px; margin: 0; display: flex; flex-direction: column; gap: 6px; }
+.ask legend { font-weight: 600; padding: 0 4px; }
+.choice { display: flex; gap: 8px; align-items: flex-start; font-weight: 400; margin: 0; }
+.pill.tool { max-width: 100%; overflow: hidden; text-overflow: ellipsis; }
+.md > :first-child { margin-top: 0; }
+.md > :last-child { margin-bottom: 0; }
+.md p, .md ul, .md ol, .md pre, .md blockquote { margin: 0 0 8px; }
+.md h3, .md h4, .md h5, .md h6 { margin: 12px 0 6px; font-size: 15px; }
+.md pre { overflow-x: auto; padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); }
+.md code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12.5px; }
+.md :not(pre) > code { background: var(--surface); border: 1px solid var(--border); border-radius: 4px; padding: 0 4px; }
+.md blockquote { border-left: 3px solid var(--border); padding-left: 10px; color: var(--text-secondary); white-space: pre-wrap; }
+.md a { color: var(--focus); }
+.md.plan { max-height: 280px; overflow-y: auto; }
+.msg.assistant .bubble.md { white-space: normal; }
+
+/* 工作区内各栏自己滚动,页面本身不滚动(否则标题栏会被卷走)。 */
+.workspace, .main, .split, .task-chat, .chat { overflow: hidden; }
+.chat .log { min-height: 80px; }
+.chat .side { flex: none; max-height: 45%; overflow-y: auto; }
+.btn { white-space: nowrap; }
+.task-list > .row.between { flex-wrap: wrap; row-gap: 4px; }

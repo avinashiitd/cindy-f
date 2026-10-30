@@ -18,6 +18,8 @@ export interface DisplayMessage {
   key: string;
   kind: DisplayKind;
   text: string;
+  /** 工具调用的一行摘要(命令、路径、网址等)。 */
+  detail?: string;
   createdAt: string;
 }
 
@@ -58,6 +60,16 @@ function contentText(content: unknown): string {
   return blocksText(record.content);
 }
 
+function toolDetail(content: unknown): string | undefined {
+  const input = tryParseObject(tryParseObject(content)?.input);
+  if (!input) return undefined;
+  for (const key of ['command', 'file_path', 'path', 'url', 'pattern', 'query', 'description']) {
+    const value = input[key];
+    if (typeof value === 'string' && value.trim()) return value.trim().split('\n')[0].slice(0, 160);
+  }
+  return undefined;
+}
+
 function toolName(content: unknown): string {
   const record = tryParseObject(content);
   const name = record?.name ?? record?.toolName;
@@ -77,7 +89,7 @@ export function toDisplayMessages(rows: readonly RemoteMessageRow[]): DisplayMes
       const text = contentText(row.content).trim();
       if (text) result.push({ key, kind: row.role, text, createdAt: row.createdAt });
     } else if (row.role === 'tool_use') {
-      result.push({ key, kind: 'tool', text: toolName(row.content), createdAt: row.createdAt });
+      result.push({ key, kind: 'tool', text: toolName(row.content), detail: toolDetail(row.content), createdAt: row.createdAt });
     } else if (row.role === 'error' || row.role === 'system') {
       const text = contentText(row.content).trim();
       if (text) result.push({ key, kind: row.role, text, createdAt: row.createdAt });

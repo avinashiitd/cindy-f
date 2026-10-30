@@ -133,6 +133,8 @@ export function createWebConnection(profile: WebRelayProfile, deps: WebConnectio
       busy: false,
     }),
     createWebSocket: deps.createWebSocket ?? browserWsFactory(),
+    // 只把警告与错误写进浏览器控制台,方便排查连接问题;不输出调试信息。
+    logger: { debug() {}, info() {}, warn: (...args) => console.warn('[device-link]', ...args), error: (...args) => console.error('[device-link]', ...args) },
   });
 
   refreshCertificates(0);
