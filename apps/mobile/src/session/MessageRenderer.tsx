@@ -9870,13 +9870,16 @@ const makeStyles = (colors: ThemeColors) => StyleSheet.create({
 export function MarkdownBody(props: Parameters<typeof MarkdownBodyBase>[0]) {
   const instanceKey = useId();
   const origin = useContext(ChatFilePathContext);
-  const renderMedia = (node: RichNode) => <RichAnswerMedia node={node} body={props} />;
+  const heavyContentVisible = useContext(MessageHeavyContentVisibilityContext);
+  const withVisibility = (content: ReactNode, visible: boolean) =>
+    <MessageHeavyContentVisibilityContext.Provider value={heavyContentVisible && visible}>{content}</MessageHeavyContentVisibilityContext.Provider>;
+  const renderMedia = (node: RichNode, visible: boolean) => withVisibility(<RichAnswerMedia node={node} body={props} />, visible);
   const parts = useMemo(() => props.renderRichAnswers ? splitRichAnswer(props.text) : [], [props.text, props.renderRichAnswers]);
   if (!parts.some(part => part.kind === 'rich')) return <MarkdownBodyBase {...props} />;
   return <View style={{ gap: spacing.lg }}>{parts.map(part => part.kind === 'rich'
     ? <RichAnswer renderMedia={renderMedia} key={part.key} source={part.source} complete={part.complete || !props.streaming}
         stateKey={`${origin?.deviceId ?? ''}:${origin?.sessionId ?? ''}:${props.richStateKey ?? props.markdownImageCacheKey ?? instanceKey}:${part.key}`}
-        renderMarkdown={(text, id) => <MarkdownBodyBase {...props} text={text} markdownImageCacheKey={`${props.markdownImageCacheKey}:${part.key}:${id}`} />} />
+        renderMarkdown={(text, id, visible) => withVisibility(<MarkdownBodyBase {...props} text={text} markdownImageCacheKey={`${props.markdownImageCacheKey}:${part.key}:${id}`} />, visible)} />
     : <MarkdownBodyBase {...props} key={part.key} text={part.source} streaming={!part.complete && props.streaming} />)}</View>;
 }
 
