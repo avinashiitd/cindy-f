@@ -14,7 +14,7 @@ import { isIP, type AddressInfo, type Socket } from 'node:net';
 import path from 'node:path';
 import { PROTOCOL_VERSION, WS_MAX_PAYLOAD_BYTES } from '@cindy/device-link-protocol';
 import { WebSocketServer } from 'ws';
-import { parseRelayAuthorization } from './credentials';
+import { parseRelayAuthorization, parseRelayWebSocketProtocols, RELAY_WS_SUBPROTOCOL } from './credentials';
 import { RelayError } from './errors';
 import { CLOSE_DEVICE_REMOVED, DEFAULT_HUB_LIMITS, Hub, type HubLimits } from './hub';
 import { silentLogger, type RelayLogger } from './logger';
@@ -22,6 +22,7 @@ import { BLOB_PATH_PREFIX, DEFAULT_MEDIA_LIMITS, MediaStore, type MediaLimits } 
 import { Pairing } from './pairing';
 import { normalizeName, RelayStore, type StoredDevice } from './store';
 import { RELAY_VERSION } from './version';
+import { loadBundledWebAssets, WEB_CLIENT_CSP, type WebAssets } from './webClient';
 
 const API_PREFIX = '/api/device-link';
 const WS_PATH = `${API_PREFIX}/ws`;
@@ -48,6 +49,11 @@ export interface RelayServerOptions {
   logger?: RelayLogger;
   /** 媒体过期清理间隔,默认 10 分钟。 */
   sweepIntervalMs?: number;
+  /**
+   * 浏览器控制端的静态资源,在 `/web/` 同源提供。缺省使用随包的构建产物(没有则不提供网页);
+   * 传 `false` 明确关闭。
+   */
+  webClient?: WebAssets | false;
   /** 当前证书到期时间(自动证书时由证书管理提供),主人在状态接口里看到。 */
   certificateExpiresAt?: () => string | null;
 }
@@ -88,6 +94,31 @@ function sendJson(res: ServerResponse, status: number, body: unknown): void {
 function sendEmpty(res: ServerResponse, status: number): void {
   res.writeHead(status, { 'Cache-Control': 'no-store' });
   res.end();
+}
+
+/** `/` 和 `/web` 转到 `/web/`;`/web/` 下只提供固定的几个文件。返回 false 表示不是网页请求。 */
+function serveWebClient(assets: WebAssets, req: IncomingMessage, res: ServerResponse, url: URL): boolean {
+  const { pathname } = url;
+  if (pathname === '/' || pathname === '/web') {
+    res.writeHead(302, { Location: '/web/', 'Cache-Control': 'no-store' });
+    res.end();
+    return true;
+  }
+  if (!pathname.startsWith('/web/')) return false;
+  const name = pathname === '/web/' ? 'index.html' : pathname.slice('/web/'.length);
+  const asset = assets.get(name);
+  if (!asset) throw new RelayError('NOT_FOUND', 'not found');
+  res.writeHead(200, {
+    'Content-Type': asset.type,
+    'Content-Length': String(asset.body.length),
+    'Cache-Control': 'no-cache',
+    'Content-Security-Policy': WEB_CLIENT_CSP,
+    'X-Content-Type-Options': 'nosniff',
+    'Referrer-Policy': 'no-referrer',
+    'X-Frame-Options': 'DENY',
+  });
+  res.end(req.method === 'HEAD' ? undefined : asset.body);
+  return true;
 }
 
 async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> {
@@ -134,6 +165,7 @@ export async function startRelayServer(options: RelayServerOptions): Promise<Rel
     hub.announce(device);
   });
   const publicUrl = options.publicUrl?.replace(/\/+$/, '');
+  const webAssets = options.webClient === false ? null : (options.webClient ?? loadBundledWebAssets());
 
   function externalBase(req: IncomingMessage): string {
     if (publicUrl) return publicUrl;
@@ -316,6 +348,7 @@ export async function startRelayServer(options: RelayServerOptions): Promise<Rel
         await media.handleBlobRequest(req, res, url);
         return;
       }
+      if (webAssets && (req.method === 'GET' || req.method === 'HEAD') && serveWebClient(webAssets, req, res, url)) return;
       if (!url.pathname.startsWith(`${API_PREFIX}/`)) throw new RelayError('NOT_FOUND', 'not found');
       for (const entry of routes) {
         const match = entry.pattern.exec(url.pathname);
@@ -347,7 +380,12 @@ export async function startRelayServer(options: RelayServerOptions): Promise<Rel
   server.requestTimeout = 0;
   server.headersTimeout = 30_000;
 
-  const wss = new WebSocketServer({ noServer: true, maxPayload: WS_MAX_PAYLOAD_BYTES });
+  const wss = new WebSocketServer({
+    noServer: true,
+    maxPayload: WS_MAX_PAYLOAD_BYTES,
+    // 浏览器握手把凭证放在子协议里;必须回选一个子协议,浏览器才肯建立连接。
+    handleProtocols: (protocols) => (protocols.has(RELAY_WS_SUBPROTOCOL) ? RELAY_WS_SUBPROTOCOL : false),
+  });
   server.on('upgrade', (req: IncomingMessage, socket: Socket, head: Buffer) => {
     socket.on('error', () => undefined);
     let url: URL;
@@ -357,7 +395,9 @@ export async function startRelayServer(options: RelayServerOptions): Promise<Rel
       socket.end('HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
       return;
     }
-    const credential = parseRelayAuthorization(req.headers.authorization);
+    const credential =
+      parseRelayAuthorization(req.headers.authorization) ??
+      parseRelayWebSocketProtocols(req.headers['sec-websocket-protocol']);
     const device = credential ? store.findByCredential(credential) : undefined;
     if (url.pathname !== WS_PATH || !device) {
       const status = url.pathname !== WS_PATH ? '404 Not Found' : '401 Unauthorized';

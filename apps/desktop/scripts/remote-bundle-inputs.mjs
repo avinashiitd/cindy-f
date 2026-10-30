@@ -21,7 +21,7 @@ export function bundleInputDigest(pkgDir, dependencyDirs = []) {
   for (const rel of ['src', 'build.mjs', 'package.json']) visit(pkgDir, rel, 'package');
   dependencyDirs.forEach((dependency, index) => {
     if (!existsSync(dependency)) throw new Error(`Remote bundle source dependency is missing: ${dependency}`);
-    for (const rel of ['src', 'package.json', 'LICENSE.opencodex']) visit(dependency, rel, `dependency:${index}`);
+    for (const rel of ['src', 'public', 'package.json', 'LICENSE.opencodex']) visit(dependency, rel, `dependency:${index}`);
   });
   return createHash('sha256').update(JSON.stringify(inputs)).digest('hex');
 }

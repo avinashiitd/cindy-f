@@ -117,8 +117,10 @@ export class Pairing {
     if (codeExpiresAt === undefined || codeExpiresAt < this.now()) {
       throw new RelayError('FORBIDDEN', 'invalid or expired join code');
     }
-    // 账号不对时保留加入码,让正确的设备还能用。
-    if (accountUserId !== this.store.ownerUserId) {
+    // 账号不对时保留加入码,让正确的设备还能用。浏览器没有 Cindy 账号,可以省略账号 ID;
+    // 准入仍由加入码、配对秘密证明和主人在电脑上的确认把关,这一项本来只防误操作。
+    const webBrowser = platform === 'web' && accountUserId === undefined;
+    if (!webBrowser && accountUserId !== this.store.ownerUserId) {
       throw new RelayError('ACCOUNT_MISMATCH', 'this relay belongs to another Cindy account');
     }
     if (this.store.get(deviceId)?.role === 'owner') {

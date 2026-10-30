@@ -6,6 +6,7 @@
  *               --relay-id <UUID> --owner-public-key <公钥> --owner-cert <证书 JSON 的 base64url>
  *   relay serve --data <目录> [--host 127.0.0.1] [--port 47820]
  *               [--tls-cert <PEM> --tls-key <PEM>] [--public-url <https://...>] [--trust-proxy]
+ *               [--no-web]
  *               [--acme-identifier <域名或IP> [--acme-http-port 80] [--acme-directory <URL>]]
  *
  * `--acme-identifier`:自动向 Let's Encrypt 申请并续期证书(http-01 验证走 `--acme-http-port`),
@@ -27,7 +28,7 @@ import { manageNginx } from './nginx';
 import { lookup } from 'node:dns/promises';
 import { isIP } from 'node:net';
 
-const BOOLEAN_FLAGS = new Set(['trust-proxy', 'ipv6', 'existing-certificate']);
+const BOOLEAN_FLAGS = new Set(['trust-proxy', 'ipv6', 'existing-certificate', 'no-web']);
 /** 首次申请证书失败后的重试间隔(Let's Encrypt 对同一名字每小时只允许几次失败验证)。 */
 const ACME_RETRY_DELAYS_MS = [60_000, 5 * 60_000, 15 * 60_000, 30 * 60_000, 60 * 60_000];
 /** 只是连不上 CA(不算失败验证、不占配额)时更快重试,部署等待的几分钟里能多试几次。 */
@@ -183,6 +184,7 @@ async function main(): Promise<void> {
       tls: material ? { cert: material.cert, key: material.key } : certPath && keyPath ? await readTlsFiles(certPath, keyPath) : undefined,
       publicUrl: flags.get('public-url'),
       trustProxyHeaders: flags.has('trust-proxy'),
+      ...(flags.has('no-web') ? { webClient: false as const } : {}),
       logger: stderrLogger,
       certificateExpiresAt: () => (material ? new Date(material.notAfter).toISOString() : null),
     });

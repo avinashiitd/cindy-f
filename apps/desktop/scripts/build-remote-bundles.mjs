@@ -55,6 +55,8 @@ const TARGETS = [
     dependencyDirs: [
       resolve(MONOREPO_ROOT, 'packages', 'device-link'),
       resolve(MONOREPO_ROOT, 'packages', 'device-link-protocol'),
+      // 浏览器控制端被内联进 relay.mjs,它变了 bundle 也要重建。
+      resolve(MONOREPO_ROOT, 'packages', 'device-link-web'),
     ],
     pkgDir: resolve(MONOREPO_ROOT, 'packages', 'device-link-relay'),
     bundleFile: 'dist/relay.mjs',

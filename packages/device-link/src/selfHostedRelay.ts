@@ -219,7 +219,8 @@ export async function submitRelayPairRequest(
     deviceName: string;
     platform: string;
     appVersion: string;
-    accountUserId: string;
+    /** 浏览器没有 Cindy 账号,省略;中转只对 `platform: 'web'` 接受缺省(见 device-link-relay pairing)。 */
+    accountUserId?: string;
     /** 新设备的签名公钥与配对证明,见 `createRelayJoinIdentity`。 */
     publicKey: string;
     proof: string;

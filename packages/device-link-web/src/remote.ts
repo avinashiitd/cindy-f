@@ -1,0 +1,162 @@
+/**
+ * 对一台被控电脑的远程调用:列表、读消息、发送、停止、审批。
+ * 全部走 device-link 隧道的白名单 channel(`REMOTE_INVOKE_ALLOWLIST`),网页没有任何超出手机的能力。
+ */
+import { PROTOCOL_VERSION, type DeviceLinkClient, type DeviceView, type Envelope } from '@cindy/device-link';
+
+import type { RemoteMessageRow } from './messages';
+import { WEB_APP_VERSION } from './join';
+
+export interface RemoteSessionRow {
+  id: string;
+  title: string;
+  status: string;
+  model: string;
+  workingDir: string | null;
+  permissionMode: string;
+  effort: string;
+  agentKind: 'cc' | 'codex' | 'pi';
+  fastMode?: boolean | 'ultrafast';
+  sdkSessionId?: string | null;
+  providerId?: string | null;
+  remoteHostId?: string | null;
+  preview?: string | null;
+  updatedAt: string;
+  lastActivityAt?: string | null;
+}
+
+export interface PendingInteraction {
+  request: { kind?: string; requestId?: string; [key: string]: unknown };
+}
+
+export interface PushEvent {
+  from: string;
+  channel: string;
+  payload: unknown;
+}
+
+export class RemoteError extends Error {
+  constructor(readonly code: string, message: string) {
+    super(message);
+    this.name = 'RemoteError';
+  }
+}
+
+const LIST_LIMIT = 100;
+
+/** 这个浏览器作为控制端对被控端声明的信息。不声明任何可选能力,被控端按最保守的旧格式回复。 */
+function controllerInfo(deviceName: string) {
+  return { controllerName: deviceName, protocolVersion: PROTOCOL_VERSION, appVersion: WEB_APP_VERSION, capabilities: [] as string[] };
+}
+
+export class RemoteApi {
+  private readonly opened = new Set<string>();
+
+  constructor(
+    private readonly client: DeviceLinkClient,
+    private readonly baseUrl: string,
+    private readonly credential: string,
+    private readonly deviceName: string,
+    private readonly fetchFn: typeof fetch = (url, init) => fetch(url, init),
+  ) {}
+
+  /** 设备列表(REST):与官方中转同形,含在线状态与是否允许被控。 */
+  async listDevices(): Promise<DeviceView[]> {
+    const res = await this.fetchFn(`${this.baseUrl}/api/device-link/devices`, {
+      headers: { Authorization: `CindyRelay ${this.credential}` },
+    });
+    if (!res.ok) throw new RemoteError(res.status === 401 ? 'UNAUTHORIZED' : 'FAILED', `devices request failed (${res.status})`);
+    const body = (await res.json()) as { devices?: DeviceView[] };
+    return Array.isArray(body.devices) ? body.devices : [];
+  }
+
+  async invoke<T>(deviceId: string, channel: string, args: unknown[] = []): Promise<T> {
+    const result = await this.client.invoke(deviceId, { channel, args });
+    if (!result.ok) throw new RemoteError(result.error.code, result.error.message);
+    return result.result as T;
+  }
+
+  /** 进入实时操作:建立控制链路(被控电脑会显示「正在被控」)。同一台电脑只建一次。 */
+  async openLink(deviceId: string): Promise<void> {
+    if (this.opened.has(deviceId)) return;
+    await this.client.openLink(deviceId, controllerInfo(this.deviceName));
+    this.opened.add(deviceId);
+  }
+
+  /** 连接断开后控制链路已失效,下次进入任务时重新建立。 */
+  resetLinks(): void {
+    this.opened.clear();
+  }
+
+  async subscribe(deviceId: string, topics: string[]): Promise<void> {
+    await this.invoke(deviceId, 'device-link:subscribe', [{ ...controllerInfo(this.deviceName), topics }]);
+  }
+
+  async unsubscribe(deviceId: string, topics: string[]): Promise<void> {
+    await this.invoke(deviceId, 'device-link:unsubscribe', [{ topics }]);
+  }
+
+  listSessions(deviceId: string): Promise<RemoteSessionRow[]> {
+    return this.invoke(deviceId, 'local-db:sessions:list', [LIST_LIMIT, 'active', { includePinned: true, fresh: true }]);
+  }
+
+  getSession(deviceId: string, sessionId: string): Promise<RemoteSessionRow> {
+    return this.invoke(deviceId, 'local-db:sessions:get', [sessionId]);
+  }
+
+  listMessages(deviceId: string, sessionId: string): Promise<RemoteMessageRow[]> {
+    return this.invoke(deviceId, 'local-db:messages:list', [sessionId]);
+  }
+
+  listPendingInteractions(deviceId: string, sessionId: string): Promise<PendingInteraction[]> {
+    return this.invoke(deviceId, 'maker:get-pending-interactions', [sessionId]);
+  }
+
+  resolvePermission(deviceId: string, requestId: string, behavior: 'allow' | 'deny'): Promise<unknown> {
+    return this.invoke(deviceId, 'maker:resolve-interaction', [requestId, { kind: 'permission', behavior }]);
+  }
+
+  stop(deviceId: string, sessionId: string): Promise<unknown> {
+    return this.invoke(deviceId, 'maker:input:stop', [sessionId, {}]);
+  }
+
+  /** 发送一条文字消息:格式与手机的 `buildQueuedTextMessage` 一致,被控端按它排队与落库。 */
+  sendText(deviceId: string, session: RemoteSessionRow, text: string, clientId: string, now = new Date()): Promise<unknown> {
+    const trimmed = text.trim();
+    const agentKind = session.agentKind === 'codex' || session.agentKind === 'pi' ? session.agentKind : 'claude-code';
+    const workingDir = session.workingDir || '';
+    const item = {
+      clientId,
+      text: trimmed,
+      persistedContent: JSON.stringify({ text: trimmed, images: [], files: [] }),
+      model: session.model,
+      effort: session.effort || '',
+      permissionMode: session.permissionMode,
+      workingDir,
+      chatMessage: { clientId, role: 'user', content: trimmed, isStreaming: false, createdAt: now.toISOString() },
+      createOpts: {
+        agentKind,
+        workingDir,
+        model: session.model,
+        effort: session.effort || '',
+        permissionMode: session.permissionMode,
+        ...(session.fastMode !== undefined ? { fastMode: session.fastMode } : {}),
+        displayReasoning: 'summarized',
+        ...(session.sdkSessionId ? { resumeSessionId: session.sdkSessionId } : {}),
+        ...(session.providerId ? { providerId: session.providerId } : {}),
+        ...(session.remoteHostId ? { remoteHostId: session.remoteHostId } : {}),
+      },
+    };
+    return this.invoke(deviceId, 'maker:input:enqueue', [session.id, item, { sendAtMs: now.getTime() }]);
+  }
+
+  /** 被控端转发来的 push 事件(`maker:event`、`local-db:messages:created` 等)。 */
+  onPush(cb: (event: PushEvent) => void): () => void {
+    return this.client.onFrame((env: Envelope) => {
+      if (env.kind !== 'push' || !env.src) return;
+      const payload = env.payload as { channel?: unknown; payload?: unknown } | undefined;
+      if (typeof payload?.channel !== 'string') return;
+      cb({ from: env.src, channel: payload.channel, payload: payload.payload });
+    });
+  }
+}

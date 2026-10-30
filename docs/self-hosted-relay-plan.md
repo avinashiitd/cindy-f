@@ -746,3 +746,70 @@ App 内不加扫码组件：加一个会改变原生指纹，需要冷更。
 - 自建中转从未发布过，不存在需要迁移的用户数据。第 2 步开发期间留下的本机配置会被忽略并清掉旧凭证文件。
 - 开发期间不含接收端挑战的旧签名客户端不兼容本次签名格式，需同步更新 Desktop / Mobile；
   中转仅原样转发 `auth` 与已有 push，无需更改已实现的服务端路由。
+
+## 17. 浏览器控制端（网页版，2026-10-30）
+
+目标：除了桌面和手机 App，也能在浏览器里远程查看、控制自己的电脑，**不依赖 Cindy 账号登录**，不改官方服务端。
+做法：自建中转同源提供一个网页控制端，网页复用本方案已有的加入流程、凭证和设备签名，不新增协议。
+
+### 17.1 拓扑与边界
+
+```
+浏览器（/web/ 页面） ──wss──▶ 自建中转 ◀──wss── 被控的 Cindy 桌面
+   控制端，只接受浏览器自己加入的凭证          （允许被控已开启）
+```
+
+- **只连自建中转。** 官方中转的认证是 Cindy 账号 token，网页不持有账号，也不应持有；官方中转与服务端零改动。
+  想用网页，就在主人电脑上开启或部署自建中转（方式 A / B），网页由这个中转在 `/web/` 提供（同源，没有 CORS，凭证不发往第三方来源）。
+- **只做控制端，和手机一样。** 浏览器不接受别人控制（`remoteControlEnabled:false`），能力边界就是 `REMOTE_INVOKE_ALLOWLIST`，不会比手机多。
+- **第一版范围**：加入、电脑列表（在线 / 是否允许被控）、任务列表、查看任务的文字消息、发送消息、停止、允许 / 拒绝工具权限请求、退出中转。
+  不含：新建任务、附件与图片、语音、远程桌面、文件浏览、模型 / 权限模式切换、系统推送、跨账号的共享任务与供应商分享；
+  需要「提问」「计划审阅」等确认时，网页只提示在电脑或手机上处理，不代为作答。
+
+### 17.2 加入与鉴权
+
+- **加入**：与电脑、手机完全相同的共享流程（`fetchRelayInfo` → `submitRelayPairRequest` → `waitForRelayApproval` → `acceptRelayDeviceCert`）。
+  主人电脑生成 `cindy://relay/join?…` 链接，粘贴到网页（也接受 `<中转地址>/web/#/join?…` 形式）；网页显示核对码，主人在电脑上同意。
+  网页用链接里的主人公钥 `o` 核对中转转交的证书，用配对秘密 `s` 证明自己的签名公钥，所以被入侵的中转同样换不掉浏览器的公钥或冒充主人。
+  加入成功后立刻把链接从地址栏和历史里清掉（秘密不留在 URL 里）。
+- **没有账号**：申请里不带 `accountUserId`。中转只对 `platform:'web'` 接受缺省（带了别的账号仍然拒绝，非 web 平台缺省仍然拒绝）。
+  这一项原本只防「误加入别人的中转」，准入仍由加入码（一次性、10 分钟）、配对秘密证明、主人在电脑上的确认和 4 位核对码把关，没有放宽。
+- **WebSocket 认证**：浏览器的 `WebSocket` 不能设置 `Authorization` 头。凭证放在 `Sec-WebSocket-Protocol`：
+  `cindy-relay.v1, cindy-credential.<凭证>`，必须同时带版本标记；中转回选 `cindy-relay.v1`。
+  这只用于 WebSocket 升级；REST 仍然只认 `Authorization: CindyRelay`。电脑 / 手机继续走原来的头，互不影响。
+- **设备签名**：与手机同一套 `RelayFrameAuthenticator`（纯 JS `@noble`，不用 `crypto.subtle`，因此局域网里用 http 打开也能工作）。
+  每条对端消息签名，收到的消息核对证书、签名、时间和计数，不通过丢弃；审批文案不能被中转替换。
+
+### 17.3 浏览器端的存储与页面安全
+
+- 浏览器存储比系统安全存储弱：凭证与签名私钥种子存在 `localStorage`（`cindy.web.relay.v1`），只对这一个中转有效，不含账号信息。
+  对应措施：页面不执行内联脚本和第三方脚本（CSP：`default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; frame-ancestors 'none'`），
+  消息正文只以文本写入页面（不使用 `innerHTML`），提供「退出此中转」（删除本机记录并让中转删除这台浏览器），加入页提示公共电脑不要加入。
+- 主人在电脑上移除这台浏览器后，凭证立即失效（4410 / 401），网页回到加入页。
+- 建议用 https 提供中转（自动证书或前置代理）：http 下加入链接里的秘密与凭证会明文经过网络，只适合同一可信局域网。
+- 可用 `relay serve --no-web` 完全关闭网页；关闭后 `/` 与 `/web/` 都是 404，其余接口不变。
+
+### 17.4 代码与打包
+
+| 位置 | 内容 |
+| --- | --- |
+| `packages/device-link-web` | 浏览器应用（无框架，TS + esbuild）：加入、连接、`RemoteApi`、界面。依赖 `@cindy/device-link` 与 `@noble`，不依赖 Electron / Node。 |
+| `packages/device-link-relay/src/webClient.ts`、`server.ts` | 在 `/web/` 提供三个固定文件（`index.html`、`app.js`、`app.css`），带 CSP；`/` 跳到 `/web/`。 |
+| `packages/device-link-relay/build.mjs` | 先构建网页，再把产物内联进 `dist/relay.mjs`，服务器上仍然只传这一个文件。 |
+| `packages/device-link/src/selfHostedRelay.ts` | `submitRelayPairRequest` 的 `accountUserId` 改为可选（Desktop / Mobile 照旧传）。 |
+
+### 17.5 验证
+
+- `packages/device-link-web/src/__tests__/webClient.e2e.test.ts`：真实中转 + 模拟被控 Desktop（开启设备签名）+ 网页的加入、浏览器式握手（Node 内置 `WebSocket`）、
+  列表 / 读取 / 审批 / 发送 / 停止的 wire 内容；错误凭证或缺版本标记的握手被拒。
+- 中转测试：静态文件与 CSP、目录穿越与未知文件 404、`--no-web`、web 缺省账号规则、子协议认证与 REST 不接受子协议。
+- 真实浏览器（Chromium，Light / Dark）对 `dist/relay.mjs` 的完整走查：加入 → 核对码 → 主人同意 → 电脑 → 任务 → 消息 / 权限卡 / 发送 → 刷新后自动重连；消息里的 HTML 仍显示为文字，地址栏不残留加入秘密。
+  Safari / Firefox、手机浏览器、慢网与断线重连、真实桌面被控端的整链未实测。
+
+### 17.6 后续
+
+- 主人电脑的「在浏览器中打开」按钮和二维码：直接给出 `<对外地址>/web/#/join?…`。
+- 新建任务、附件、模型 / 权限模式、提问与计划审阅卡片。
+- 更完整的消息渲染（Markdown、工具调用详情）。
+- 网页版的桌面端设置页入口与开关（目前由 `relay serve --no-web` 控制；Cindy 内运行的中转默认提供网页）。
+

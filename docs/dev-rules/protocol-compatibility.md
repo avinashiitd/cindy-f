@@ -1,5 +1,19 @@
 # 跨端协议兼容
 
+## 自建中转的浏览器控制端（2026-10-30）
+
+自建中转增量支持浏览器控制端（[方案 §17](../self-hosted-relay-plan.md#17-浏览器控制端网页版2026-10-30)）：
+
+- **WebSocket 子协议认证**：升级请求可以改用 `Sec-WebSocket-Protocol: cindy-relay.v1, cindy-credential.<凭证>`
+  （浏览器无法设置 `Authorization`）。必须同时带版本标记才算认证，中转回选 `cindy-relay.v1`；
+  原 `Authorization: CindyRelay` 路径不变，REST 仍只认 `Authorization`。官方中转不受影响。
+- **加入申请可省略 `accountUserId`**：仅当 `platform === 'web'`；带了错误账号或其它平台缺省仍返回 `ACCOUNT_MISMATCH`，
+  准入仍由加入码、配对秘密证明与主人确认把关。`submitRelayPairRequest` 的该参数改为可选，Desktop / Mobile 照旧传。
+- **静态页面**：中转在 `/web/` 提供三个固定文件并带严格 CSP，`/` 跳转 `/web/`；`--no-web` 关闭。不新增 API、帧类型或能力协商。
+- 旧中转没有这些行为：网页连旧中转会在升级时被拒（401），加入页提示失败；旧客户端不受影响。
+  浏览器是纯控制端，沿用 `REMOTE_INVOKE_ALLOWLIST`，被控 Desktop 无需升级。回退中转版本时网页不可用，其它设备照常。
+- 回归：`packages/device-link-web/src/__tests__/webClient.e2e.test.ts`、`packages/device-link-relay/src/__tests__/relay.test.ts` 的 “browser control support”。
+
 ## Chat Server 只读工作发现与定向通知（2026-10-29）
 
 `/me.capabilities` 新增 `workAvailabilityVersion:1`、`workNotificationsVersion:1`。
