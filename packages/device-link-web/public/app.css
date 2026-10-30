@@ -72,7 +72,7 @@ textarea, input[type=text], input:not([type]) {
 .item:disabled { opacity: .6; cursor: not-allowed; }
 .item-main { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1; }
 .chat { gap: 12px; }
-.log { flex: 1; min-height: 240px; max-height: calc(100dvh - 260px); overflow-y: auto; display: flex; flex-direction: column; gap: 10px; padding: 4px 0; }
+.log { flex: 1; min-height: 120px; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; padding: 4px 0; }
 .msg { display: flex; }
 .msg.user { justify-content: flex-end; }
 .bubble { max-width: 85%; white-space: pre-wrap; overflow-wrap: anywhere; padding: 10px 14px; border-radius: 12px; border: 1px solid var(--border); background: var(--surface); }
@@ -88,3 +88,58 @@ textarea, input[type=text], input:not([type]) {
   background: var(--accent); color: var(--on-accent); padding: 10px 16px; border-radius: 12px; z-index: 10; }
 @media (max-width: 600px) { .bar { padding: 8px 12px; } .panel { padding: 12px; } .bubble { max-width: 95%; } }
 @media (prefers-reduced-motion: no-preference) { .btn, .item { transition: background-color .12s ease; } }
+
+/* ── 桌面浏览器的宽屏工作区:左侧电脑列表,右侧任务或远程桌面 ───────────────────── */
+.shell { height: 100dvh; min-height: 0; }
+.workspace { flex: 1; min-height: 0; display: grid; grid-template-columns: 260px minmax(0, 1fr); }
+.sidebar { border-right: 1px solid var(--border); padding: 12px; overflow-y: auto; display: flex; flex-direction: column; gap: 6px; }
+.side-title { font-size: 13px; font-weight: 600; color: var(--text-secondary); margin: 4px 4px 6px; }
+.main { min-width: 0; min-height: 0; display: flex; flex-direction: column; }
+.empty { margin: 32px; }
+.computer { display: flex; flex-direction: column; gap: 4px; border-radius: 12px; }
+.computer.active { background: var(--surface); border: 1px solid var(--border); }
+.computer-name { display: flex; align-items: center; gap: 10px; width: 100%; text-align: left; font: inherit; color: inherit;
+  background: transparent; border: 0; border-radius: 12px; padding: 10px 12px; cursor: pointer; }
+.computer-name:hover:not(:disabled) { background: var(--surface-hover); }
+.computer-name:disabled { opacity: .55; cursor: not-allowed; }
+.dot { width: 8px; height: 8px; border-radius: 9999px; flex: none; background: var(--border); }
+.dot.on { background: var(--ok); }
+.tabs { display: flex; gap: 4px; padding: 0 8px 8px; }
+.tab { flex: 1; font: inherit; font-size: 12px; color: var(--text-secondary); background: transparent; border: 1px solid var(--border);
+  border-radius: 9999px; padding: 4px 8px; cursor: pointer; }
+.tab.on { background: var(--accent); color: var(--on-accent); border-color: var(--accent); }
+.split { flex: 1; min-height: 0; display: grid; grid-template-columns: 320px minmax(0, 1fr); }
+.task-list { border-right: 1px solid var(--border); padding: 12px; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; }
+.task-chat { min-width: 0; min-height: 0; display: flex; flex-direction: column; padding: 16px; }
+.item.active { background: var(--surface-hover); }
+.chat { flex: 1; min-height: 0; display: flex; flex-direction: column; gap: 12px; }
+.chat .log { max-height: none; }
+.pill.muted { color: var(--text-secondary); }
+
+/* 远程桌面查看器:画面运行时(packages/maker-shared 的 viewerRuntime)需要的元素与样式。 */
+.viewer { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.viewer-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding: 8px 12px; border-bottom: 1px solid var(--border); }
+.viewer-toolbar select { font: inherit; color: inherit; background: var(--surface); border: 1px solid var(--border); border-radius: 9999px; padding: 4px 10px; }
+.viewer-toolbar .check { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-secondary); }
+.grow { flex: 1; }
+.viewer-content { --foreground: var(--text); position: relative; flex: 1; min-height: 0; overflow: hidden; background: var(--surface); }
+.viewer-content:fullscreen { background: #000; }
+.viewer-content #stage { position: absolute; inset: 0; overflow: hidden; touch-action: none; user-select: none; outline: none; }
+.viewer-content #stage > img, .viewer-content video { position: absolute; max-width: none; pointer-events: none; transform-origin: 0 0; }
+.viewer-content #bg { position: absolute; inset: 0; overflow: hidden; z-index: 0; display: none; pointer-events: none; }
+.viewer-content #bg-canvas { position: absolute; inset: 0; width: 100%; height: 100%; filter: blur(16px); transform: scale(1.12); transform-origin: center; opacity: .72; }
+.viewer-content video { display: none; z-index: 0; }
+.viewer-content #image { z-index: 1; }
+.viewer-content img:not([src]) { visibility: hidden; }
+.viewer-content #cursor { position: absolute; z-index: 3; width: 18px; height: 18px; border: 0; pointer-events: none; display: none; }
+.viewer-content #cursor-image { position: absolute; inset: 0; width: 100%; height: 100%; }
+.viewer-content #keyboard-input { position: absolute; bottom: 0; left: 0; width: 1px; height: 1px; opacity: .01; pointer-events: none; border: 0; padding: 0; resize: none; }
+.viewer-content #mouse-buttons { display: none; }
+.viewer-overlay { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); z-index: 5; display: flex; flex-direction: column; align-items: center; gap: 12px;
+  max-width: 420px; text-align: center; padding: 16px 20px; border: 1px solid var(--border); border-radius: 12px; background: var(--bg); }
+.viewer-overlay[hidden] { display: none; }
+.viewer-overlay p { margin: 0; }
+@media (max-width: 900px) {
+  .workspace { grid-template-columns: 200px minmax(0, 1fr); }
+  .split { grid-template-columns: 240px minmax(0, 1fr); }
+}

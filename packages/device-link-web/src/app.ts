@@ -12,6 +12,7 @@ import { joinRelay, parseJoinInput } from './join';
 import { toDisplayMessages, type RemoteMessageRow } from './messages';
 import { clearProfile, loadProfile, saveProfile, type WebRelayProfile } from './profile';
 import { RemoteApi, RemoteError, type PendingInteraction, type RemoteSessionRow } from './remote';
+import { DEFAULT_DESKTOP_PREFERENCES, WebDesktopController, type DesktopPreferences, type DesktopSnapshot } from './desktop';
 
 const REFRESH_DEBOUNCE_MS = 300;
 
@@ -223,68 +224,119 @@ export function mountApp(root: HTMLElement): void {
     showJoin();
   }
 
-  // ── 电脑列表 ────────────────────────────────────────────────────────────
+  // ── 工作区:左侧电脑列表,右侧任务或远程桌面(桌面浏览器的宽屏布局)─────────────
+  type Mode = 'tasks' | 'desktop';
+  let selected: { deviceId: string; mode: Mode } | null = null;
+  let pane: { dispose(): void } | null = null;
+
   function showDevices(): void {
-    setView(() => {
-      const others = [...devices.values()].filter((device) => !device.isSelf)
-        .sort((a, b) => Number(b.online) - Number(a.online) || a.name.localeCompare(b.name));
-      replaceChildren(shell, header(),
-        h('main', { class: 'panel' },
-          h('h1', {}, t.devices),
-          others.length === 0 ? h('p', { class: 'note' }, t.noDevices) : null,
-          h('ul', { class: 'list' }, ...others.map((device) => h('li', {},
-            h('button', {
-              class: 'item', disabled: !device.online || !device.remoteControlEnabled,
-              onclick: () => showSessions(device),
-            },
-            h('span', { class: 'item-main' }, h('strong', {}, device.name),
-              h('span', { class: 'sub' }, [device.platform, device.appVersion].filter(Boolean).join(' · '))),
-            h('span', { class: `pill ${device.online ? 'ok' : 'muted'}` }, device.online ? t.online : t.offline),
-            device.online && !device.remoteControlEnabled ? h('span', { class: 'pill warn' }, t.controlOff) : null))))));
-    });
+    selected = null;
+    showWorkspace();
   }
 
-  // ── 任务列表 ────────────────────────────────────────────────────────────
-  function showSessions(device: DeviceView): void {
+  function showWorkspace(): void {
+    const sidebar = h('nav', { class: 'sidebar', 'aria-label': t.devices });
+    const main = h('main', { class: 'main' });
+
+    const paintSidebar = () => {
+      const others = [...devices.values()].filter((device) => !device.isSelf)
+        .sort((a, b) => Number(b.online) - Number(a.online) || a.name.localeCompare(b.name));
+      replaceChildren(sidebar,
+        h('h2', { class: 'side-title' }, t.devices),
+        others.length === 0 ? h('p', { class: 'note' }, t.noDevices) : null,
+        ...others.map((device) => {
+          const usable = device.online && device.remoteControlEnabled;
+          const active = selected?.deviceId === device.deviceId;
+          return h('div', { class: `computer${active ? ' active' : ''}` },
+            h('button', { class: 'computer-name', disabled: !usable, onclick: () => openDevice(device.deviceId, 'tasks') },
+              h('span', { class: `dot ${device.online ? 'on' : 'off'}`, 'aria-hidden': 'true' }),
+              h('span', { class: 'item-main' }, h('strong', {}, device.name),
+                h('span', { class: 'sub' }, device.online ? (device.remoteControlEnabled ? [device.platform, device.appVersion].filter(Boolean).join(' · ') : t.controlOff) : t.offline))),
+            active ? h('div', { class: 'tabs', role: 'tablist' },
+              h('button', { class: `tab${selected?.mode === 'tasks' ? ' on' : ''}`, role: 'tab', onclick: () => openDevice(device.deviceId, 'tasks') }, t.tabTasks),
+              h('button', { class: `tab${selected?.mode === 'desktop' ? ' on' : ''}`, role: 'tab', onclick: () => openDevice(device.deviceId, 'desktop') }, t.tabDesktop)) : null);
+        }));
+    };
+
+    const openDevice = (deviceId: string, mode: Mode) => {
+      const device = devices.get(deviceId);
+      if (!device || !api) return;
+      if (selected?.deviceId === deviceId && selected.mode === mode && pane) return;
+      pane?.dispose();
+      pane = null;
+      selected = { deviceId, mode };
+      paintSidebar();
+      pane = mode === 'tasks'
+        ? mountTasks(main, device)
+        : mountDesktop(main, device);
+    };
+
+    teardownWorkspace?.();
+    teardownWorkspace = () => { pane?.dispose(); pane = null; };
+    setView(() => {
+      if (!shell.querySelector('.workspace')) {
+        replaceChildren(shell, header(), h('div', { class: 'workspace' }, sidebar, main));
+        if (!selected) replaceChildren(main, h('p', { class: 'note empty' }, t.selectComputer));
+      } else {
+        shell.querySelector('.bar')?.replaceWith(header());
+      }
+      paintSidebar();
+    }, () => { teardownWorkspace?.(); teardownWorkspace = null; });
+  }
+  let teardownWorkspace: (() => void) | null = null;
+
+  // ── 任务:左边任务列表,右边所选任务的对话 ─────────────────────────────────────
+  function mountTasks(container: HTMLElement, device: DeviceView): { dispose(): void } {
     let sessions: RemoteSessionRow[] = [];
     let failed = false;
-    let timer: ReturnType<typeof setTimeout> | undefined;
     let alive = true;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let chat: { dispose(): void } | null = null;
+    let activeId: string | null = null;
+
+    const listEl = h('div', { class: 'task-list' });
+    const chatEl = h('div', { class: 'task-chat' }, h('p', { class: 'note empty' }, t.selectTask));
+    replaceChildren(container, h('div', { class: 'split' }, listEl, chatEl));
+
+    const paintList = () => replaceChildren(listEl,
+      h('div', { class: 'row between' }, h('h2', { class: 'side-title' }, t.tasks),
+        h('button', { class: 'btn ghost', onclick: () => void load() }, t.refresh)),
+      failed ? h('p', { class: 'note error' }, t.loadFailed) : null,
+      !failed && sessions.length === 0 ? h('p', { class: 'note' }, t.noTasks) : null,
+      h('ul', { class: 'list' }, ...sessions.map((session) => h('li', {},
+        h('button', { class: `item${session.id === activeId ? ' active' : ''}`, onclick: () => openChat(session) },
+          h('span', { class: 'item-main' }, h('strong', {}, session.title || session.id),
+            session.preview ? h('span', { class: 'sub clamp' }, session.preview) : null,
+            h('span', { class: 'sub' }, formatTime(session.lastActivityAt ?? session.updatedAt))))))));
 
     const load = async () => {
       if (!api) return;
-      try {
-        sessions = await api.listSessions(device.deviceId);
-        failed = false;
-      } catch {
-        failed = true;
-      }
-      if (alive) render();
+      try { sessions = await api.listSessions(device.deviceId); failed = false; } catch { failed = true; }
+      if (alive) paintList();
     };
     const schedule = () => { clearTimeout(timer); timer = setTimeout(() => void load(), REFRESH_DEBOUNCE_MS); };
-    const render = () => replaceChildren(shell,
-      header(h('button', { class: 'btn ghost', onclick: showDevices }, `← ${t.back}`)),
-      h('main', { class: 'panel' },
-        h('div', { class: 'row between' }, h('h1', {}, `${device.name} · ${t.tasks}`),
-          h('button', { class: 'btn ghost', onclick: () => void load() }, t.refresh)),
-        failed ? h('p', { class: 'note error' }, t.loadFailed) : null,
-        !failed && sessions.length === 0 ? h('p', { class: 'note' }, t.noTasks) : null,
-        h('ul', { class: 'list' }, ...sessions.map((session) => h('li', {},
-          h('button', { class: 'item', onclick: () => showSession(device, session) },
-            h('span', { class: 'item-main' }, h('strong', {}, session.title || session.id),
-              session.preview ? h('span', { class: 'sub clamp' }, session.preview) : null),
-            h('span', { class: 'sub' }, formatTime(session.lastActivityAt ?? session.updatedAt))))))));
+
+    const openChat = (session: RemoteSessionRow) => {
+      chat?.dispose();
+      activeId = session.id;
+      paintList();
+      chat = mountChat(chatEl, device, session);
+    };
 
     const off = api?.onPush((event) => {
       if (event.from === device.deviceId && event.channel.startsWith('local-db:sessions:')) schedule();
     });
-    setView(render, () => { alive = false; clearTimeout(timer); off?.(); void api?.unsubscribe(device.deviceId, ['sessions']).catch(() => undefined); });
     void api?.subscribe(device.deviceId, ['sessions']).catch(() => undefined);
     void load();
+    return {
+      dispose() {
+        alive = false; clearTimeout(timer); off?.(); chat?.dispose();
+        void api?.unsubscribe(device.deviceId, ['sessions']).catch(() => undefined);
+      },
+    };
   }
 
-  // ── 单个任务 ────────────────────────────────────────────────────────────
-  function showSession(device: DeviceView, initial: RemoteSessionRow): void {
+  function mountChat(container: HTMLElement, device: DeviceView, initial: RemoteSessionRow): { dispose(): void } {
     let session = initial;
     let rows: RemoteMessageRow[] = [];
     let interactions: PendingInteraction[] = [];
@@ -298,6 +350,9 @@ export function mountApp(root: HTMLElement): void {
     const input = h('textarea', { class: 'composer', rows: 2, placeholder: t.placeholder });
     const log = h('div', { class: 'log', role: 'log' });
     const side = h('div', { class: 'side' });
+    const runBadge = h('span', { class: 'pill ok' }, t.running);
+    const stopButton = h('button', { class: 'btn', onclick: () => api && void api.stop(device.deviceId, session.id).then(load, load) }, t.stop);
+    const titleEl = h('h1', {}, session.title || session.id);
 
     const load = async () => {
       if (!api) return;
@@ -308,14 +363,10 @@ export function mountApp(root: HTMLElement): void {
           api.listPendingInteractions(device.deviceId, session.id).catch(() => [] as PendingInteraction[]),
           api.invoke<Array<{ sessionId: string; isTurnRunning?: boolean }>>(device.deviceId, 'maker:list-active').catch(() => []),
         ]);
-        session = fresh;
-        rows = messages;
-        interactions = pending;
+        session = fresh; rows = messages; interactions = pending;
         running = active.some((item) => item.sessionId === session.id && item.isTurnRunning);
         error = '';
-      } catch {
-        error = t.loadFailed;
-      }
+      } catch { error = t.loadFailed; }
       if (alive) paint();
     };
     const schedule = () => { clearTimeout(timer); timer = setTimeout(() => void load(), REFRESH_DEBOUNCE_MS); };
@@ -325,28 +376,22 @@ export function mountApp(root: HTMLElement): void {
       try { await api.resolvePermission(device.deviceId, request.requestId, behavior); } catch (e) { error = t.sendFailed + (e instanceof Error ? e.message : ''); }
       await load();
     };
-
     const send = async () => {
       const text = input.value.trim();
       if (!text || sending || !api) return;
       sending = true;
-      try {
-        await api.sendText(device.deviceId, session, text, newClientId());
-        input.value = '';
-        error = '';
-      } catch (e) {
-        error = t.sendFailed + (e instanceof Error ? e.message : '');
-      }
+      try { await api.sendText(device.deviceId, session, text, newClientId()); input.value = ''; error = ''; }
+      catch (e) { error = t.sendFailed + (e instanceof Error ? e.message : ''); }
       sending = false;
       await load();
     };
-
     const paint = () => {
-      const stickToBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 80;
+      const stick = log.scrollHeight - log.scrollTop - log.clientHeight < 80;
+      titleEl.textContent = session.title || session.id;
       replaceChildren(log, ...toDisplayMessages(rows).map((message) =>
         h('div', { class: `msg ${message.kind}` },
           message.kind === 'tool' ? h('span', { class: 'pill muted' }, `${t.tool}: ${message.text}`) : h('div', { class: 'bubble' }, message.text))));
-      if (stickToBottom) log.scrollTop = log.scrollHeight;
+      if (stick) log.scrollTop = log.scrollHeight;
       replaceChildren(side,
         ...interactions.map((item) => {
           const request = item.request;
@@ -362,40 +407,139 @@ export function mountApp(root: HTMLElement): void {
           return h('div', { class: 'card' }, h('p', {}, t.unsupportedInteraction));
         }),
         error ? h('p', { class: 'note error' }, error) : null);
-      stopButton.hidden = !running;
-      runBadge.hidden = !running;
+      stopButton.hidden = !running; runBadge.hidden = !running;
     };
-
-    const stopButton = h('button', { class: 'btn', onclick: () => api && void api.stop(device.deviceId, session.id).then(load, load) }, t.stop);
-    const runBadge = h('span', { class: 'pill ok' }, t.running);
     input.addEventListener('keydown', (event) => {
       if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) { event.preventDefault(); void send(); }
     });
-
     const off = api?.onPush((event) => {
       if (event.from !== device.deviceId) return;
       if (event.channel.startsWith('maker:') || event.channel.startsWith('local-db:messages:') || event.channel.startsWith('local-db:sessions:')) schedule();
     });
-
-    setView(() => {
-      replaceChildren(shell,
-        header(h('button', { class: 'btn ghost', onclick: () => showSessions(device) }, `← ${t.back}`)),
-        h('main', { class: 'panel chat' },
-          h('div', { class: 'row between' }, h('h1', {}, session.title || session.id), h('div', { class: 'row' }, runBadge, stopButton)),
-          log, side,
-          h('div', { class: 'row composer-row' }, input, h('button', { class: 'btn primary', onclick: () => void send() }, t.send))));
-      paint();
-    }, () => { alive = false; clearTimeout(timer); off?.(); void api?.unsubscribe(device.deviceId, [topic]).catch(() => undefined); });
-
+    replaceChildren(container, h('div', { class: 'chat' },
+      h('div', { class: 'row between' }, titleEl, h('div', { class: 'row' }, runBadge, stopButton)),
+      log, side,
+      h('div', { class: 'row composer-row' }, input, h('button', { class: 'btn primary', onclick: () => void send() }, t.send))));
+    paint();
     void (async () => {
-      try {
-        await api?.openLink(device.deviceId);
-        await api?.subscribe(device.deviceId, [topic]);
-      } catch (e) {
-        error = e instanceof RemoteError && e.code === 'REMOTE_DISABLED' ? t.remoteOff : t.loadFailed;
-      }
+      try { await api?.openLink(device.deviceId); await api?.subscribe(device.deviceId, [topic]); }
+      catch (e) { error = e instanceof RemoteError && e.code === 'REMOTE_DISABLED' ? t.remoteOff : t.loadFailed; }
       await load();
     })();
+    return {
+      dispose() {
+        alive = false; clearTimeout(timer); off?.();
+        void api?.unsubscribe(device.deviceId, [topic]).catch(() => undefined);
+      },
+    };
+  }
+
+  // ── 远程桌面 ────────────────────────────────────────────────────────────
+  function mountDesktop(container: HTMLElement, device: DeviceView): { dispose(): void } {
+    const prefKey = `cindy.web.desktop.${device.deviceId}`;
+    const loadPrefs = (): DesktopPreferences => {
+      try {
+        const raw = JSON.parse(storage?.getItem(prefKey) ?? 'null') as Partial<DesktopPreferences> | null;
+        return {
+          lockOnExit: raw?.lockOnExit !== false,
+          idleTimeoutMinutes: ([0, 1, 5, 10, 15, 30] as number[]).includes(raw?.idleTimeoutMinutes as number)
+            ? raw!.idleTimeoutMinutes as DesktopPreferences['idleTimeoutMinutes'] : DEFAULT_DESKTOP_PREFERENCES.idleTimeoutMinutes,
+          audio: raw?.audio === true,
+        };
+      } catch { return { ...DEFAULT_DESKTOP_PREFERENCES }; }
+    };
+
+    const stage = h('div', { id: 'stage', tabindex: 0, 'aria-label': t.tabDesktop },
+      h('div', { id: 'bg', 'aria-hidden': 'true' }, h('canvas', { id: 'bg-canvas' })),
+      h('img', { id: 'image', alt: '' }),
+      h('video', { id: 'video', autoplay: true, muted: true, playsinline: true }),
+      h('div', { id: 'cursor' }, h('img', { id: 'cursor-image', alt: '' })));
+    const overlay = h('div', { class: 'viewer-overlay', role: 'status' });
+    const content = h('div', { class: 'viewer-content' }, stage,
+      h('textarea', { id: 'keyboard-input', autocapitalize: 'off', autocomplete: 'off', spellcheck: false, 'aria-label': 'Keyboard' }),
+      h('div', { id: 'mouse-buttons', hidden: true }, h('button', { id: 'mouse-left', type: 'button' }), h('button', { id: 'mouse-right', type: 'button' }),
+        h('button', { id: 'mouse-wheel', type: 'button' }, h('span', { id: 'mouse-wheel-grip' }))),
+      overlay);
+    const toolbar = h('div', { class: 'viewer-toolbar' });
+    replaceChildren(container, h('div', { class: 'viewer' }, toolbar, content));
+
+    let controller: WebDesktopController | null = null;
+    const select = (id: string, label: string, options: Array<[string, string]>, value: string, onChange: (v: string) => void) => {
+      const el = h('select', { id, 'aria-label': label }, ...options.map(([v, text]) => h('option', { value: v }, text)));
+      el.value = value;
+      el.addEventListener('change', () => onChange(el.value));
+      return el;
+    };
+    const paintToolbar = (state: DesktopSnapshot) => {
+      const status = state.status === 'live' ? t.desktopLive : state.status === 'compatibility' ? t.desktopScreenshots
+        : state.status === 'reconnecting' ? t.desktopReconnecting : t.desktopConnecting;
+      const caps = state.caps;
+      replaceChildren(toolbar,
+        h('span', { class: `pill ${state.ready ? 'ok' : 'muted'}` }, state.ready && state.latency !== null ? `${status} · ${Math.round(state.latency)} ms` : status),
+        caps && caps.displays.length > 1 ? select('dd-display', t.desktopDisplay, caps.displays.map((d) => [d.id, d.name || d.id]), state.displayId, (v) => controller?.selectDisplay(v)) : null,
+        h('button', { class: 'btn ghost', onclick: () => controller?.fit(), disabled: !state.ready }, t.desktopFit),
+        h('button', { class: 'btn ghost', onclick: () => controller?.actualSize(), disabled: !state.ready }, t.desktopActual),
+        caps?.videoSettings ? select('dd-fps', t.desktopFps, [['30', '30 fps'], ['60', '60 fps']], String(state.settings.fps), (v) => controller?.settings({ fps: v === '60' ? 60 : 30 })) : null,
+        caps?.videoSettings ? select('dd-quality', t.desktopQuality, [['auto', t.desktopQualityAuto], ['saver', t.desktopQualitySaver], ['hd', t.desktopQualityHd]],
+          state.settings.quality, (v) => controller?.settings({ quality: v as 'auto' | 'saver' | 'hd' })) : null,
+        caps?.systemAudio ? h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: state.preferences.audio, onchange: (e: Event) => controller?.preferences({ audio: (e.target as HTMLInputElement).checked }) }), t.desktopAudio) : null,
+        caps?.lockOnExit ? h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: state.preferences.lockOnExit, onchange: (e: Event) => controller?.preferences({ lockOnExit: (e.target as HTMLInputElement).checked }) }), t.desktopLockOnExit) : null,
+        caps?.idleLock ? select('dd-idle', t.desktopIdle, ([0, 1, 5, 10, 15, 30] as const).map((m) => [String(m), m === 0 ? t.desktopIdleNever : t.desktopMinutes.replace('{n}', String(m))] as [string, string]),
+          String(state.preferences.idleTimeoutMinutes), (v) => controller?.preferences({ idleTimeoutMinutes: Number(v) as DesktopPreferences['idleTimeoutMinutes'] })) : null,
+        h('span', { class: 'grow' }),
+        h('button', { class: 'btn ghost', onclick: () => void toggleFullscreen() }, t.desktopFullscreen),
+        h('button', { class: 'btn', onclick: () => void disconnect() }, t.desktopDisconnect));
+    };
+    const paintOverlay = (state: DesktopSnapshot) => {
+      if (state.error) {
+        const errors = t.desktopErrors as Record<string, string>;
+        replaceChildren(overlay,
+          h('p', {}, errors[state.error] ?? t.desktopErrors.failed),
+          h('button', { class: 'btn primary', onclick: () => controller?.retry() }, state.error === 'connectionBusy' ? t.desktopTakeover : t.desktopRetry));
+        overlay.hidden = false;
+      } else if (!state.ready) {
+        replaceChildren(overlay, h('p', {}, state.status === 'reconnecting' ? t.desktopReconnecting : t.desktopConnecting));
+        overlay.hidden = false;
+      } else overlay.hidden = true;
+    };
+
+    const toggleFullscreen = async () => {
+      try {
+        if (document.fullscreenElement) await document.exitFullscreen();
+        else await content.requestFullscreen();
+      } catch { /* 浏览器拒绝全屏时保持原样。 */ }
+    };
+    // 全屏时请求键盘锁定,Ctrl+W、Cmd+Tab 以外的系统快捷键才会发给远程电脑(仅 Chromium 支持)。
+    const onFullscreen = () => {
+      const keyboard = (navigator as Navigator & { keyboard?: { lock?: () => Promise<void>; unlock?: () => void } }).keyboard;
+      if (document.fullscreenElement === content) void keyboard?.lock?.().catch(() => undefined);
+      else keyboard?.unlock?.();
+    };
+    document.addEventListener('fullscreenchange', onFullscreen);
+
+    const disconnect = async () => {
+      const current = controller;
+      controller = null;
+      await current?.close();
+      showDevices();
+    };
+
+    controller = new WebDesktopController(api!, device.deviceId, content, loadPrefs(), (state) => {
+      try { storage?.setItem(prefKey, JSON.stringify(state.preferences)); } catch { /* 偏好只是便利。 */ }
+      paintToolbar(state);
+      paintOverlay(state);
+    });
+    paintToolbar(controller.snapshot);
+    paintOverlay(controller.snapshot);
+    stage.focus();
+    return {
+      dispose() {
+        document.removeEventListener('fullscreenchange', onFullscreen);
+        const current = controller;
+        controller = null;
+        if (current) void current.close();
+      },
+    };
   }
 
   // ── 启动 ────────────────────────────────────────────────────────────────

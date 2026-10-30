@@ -1076,6 +1076,9 @@ importers:
       '@cindy/device-link-protocol':
         specifier: workspace:*
         version: link:../device-link-protocol
+      '@cindy/maker-shared':
+        specifier: workspace:*
+        version: link:../maker-shared
       '@noble/curves':
         specifier: 1.9.7
         version: 1.9.7

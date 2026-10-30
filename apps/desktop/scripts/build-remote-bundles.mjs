@@ -57,6 +57,8 @@ const TARGETS = [
       resolve(MONOREPO_ROOT, 'packages', 'device-link-protocol'),
       // 浏览器控制端被内联进 relay.mjs,它变了 bundle 也要重建。
       resolve(MONOREPO_ROOT, 'packages', 'device-link-web'),
+      // 网页的远程桌面画面运行时来自 maker-shared。
+      resolve(MONOREPO_ROOT, 'packages', 'maker-shared'),
     ],
     pkgDir: resolve(MONOREPO_ROOT, 'packages', 'device-link-relay'),
     bundleFile: 'dist/relay.mjs',

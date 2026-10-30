@@ -20,7 +20,8 @@
     "@cindy/device-link": "workspace:*",
     "@cindy/device-link-protocol": "workspace:*",
     "@noble/curves": "1.9.7",
-    "@noble/hashes": "^1.8.0"
+    "@noble/hashes": "^1.8.0",
+    "@cindy/maker-shared": "workspace:*"
   },
   "devDependencies": {
     "@types/node": "*",
