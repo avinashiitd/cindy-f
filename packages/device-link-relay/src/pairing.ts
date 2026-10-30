@@ -20,6 +20,7 @@ import {
 import { nodeRelayAuthCrypto } from '@cindy/device-link/node-relay-crypto';
 import { isRelayPublicKey, verifyRelayDeviceCert, type RelayDeviceCert } from '@cindy/device-link/relay-auth';
 import { RelayError } from './errors';
+import { isAccountlessRelayOwner } from '@cindy/device-link';
 import { DEVICE_ID_PATTERN, normalizeName, type RelayStore, type StoredDevice } from './store';
 
 export const JOIN_CODE_TTL_MS = 10 * 60 * 1000;
@@ -118,9 +119,11 @@ export class Pairing {
       throw new RelayError('FORBIDDEN', 'invalid or expired join code');
     }
     // 账号不对时保留加入码,让正确的设备还能用。浏览器没有 Cindy 账号,可以省略账号 ID;
-    // 准入仍由加入码、配对秘密证明和主人在电脑上的确认把关,这一项本来只防误操作。
+    // 未登录开启的中转不属于任何账号,也不核对。准入仍由加入码、配对秘密证明和主人在电脑上的确认把关,
+    // 账号这一项本来只防误操作。
     const webBrowser = platform === 'web' && accountUserId === undefined;
-    if (!webBrowser && accountUserId !== this.store.ownerUserId) {
+    const accountless = isAccountlessRelayOwner(this.store.ownerUserId);
+    if (!accountless && !webBrowser && accountUserId !== this.store.ownerUserId) {
       throw new RelayError('ACCOUNT_MISMATCH', 'this relay belongs to another Cindy account');
     }
     if (this.store.get(deviceId)?.role === 'owner') {

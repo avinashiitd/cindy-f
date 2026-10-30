@@ -12,6 +12,8 @@
 - **静态页面**：中转在 `/web/` 提供三个固定文件并带严格 CSP，`/` 跳转 `/web/`；`--no-web` 关闭。不新增 API、帧类型或能力协商。
 - **远程桌面**：浏览器沿用既有 `device-link:remote-desktop:v1` 通道与共享查看器，没有新增帧或能力；被控 Desktop 不需要升级。
   浏览器作为控制端不声明可选能力，被控端按保守格式回复。
+- **不属于账号的中转**：主人账号 ID 以 `local:` 开头（Desktop 本机模式开启 / 部署）时，加入申请不核对账号 ID，任何平台都可省略。
+  旧中转没有这条规则：本机模式的电脑或不带账号的设备加入旧中转会被 `ACCOUNT_MISMATCH` 拒绝；属于账号的中转行为不变。
 - 旧中转没有这些行为：网页连旧中转会在升级时被拒（401），加入页提示失败；旧客户端不受影响。
   浏览器是纯控制端，沿用 `REMOTE_INVOKE_ALLOWLIST`，被控 Desktop 无需升级。回退中转版本时网页不可用，其它设备照常。
 - 回归：`packages/device-link-web/src/__tests__/webClient.e2e.test.ts`、`packages/device-link-relay/src/__tests__/relay.test.ts` 的 “browser control support”。

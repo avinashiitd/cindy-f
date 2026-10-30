@@ -160,13 +160,16 @@ export function RemoteControlSection() {
   const { mode } = useAuth();
   const location = useLocation();
   const navigate = useNavigate();
-  const deviceLinkAvailable = mode === 'cloud';
+  // 未登录的本机模式也能用自建中转(main 只在那时连自建中转,从不连官方中转):
+  // 中转设置一直可见,「我的设备」在正在使用自建中转时才出现。
+  const relayAvailable = mode === 'cloud' || mode === 'local';
+  const relay = useSelfHostedRelayState(relayAvailable);
+  const deviceLinkAvailable = mode === 'cloud' || (mode === 'local' && relay.state?.mode === 'self-hosted');
   const s = useDeviceLinkSettings(deviceLinkAvailable);
 
   // 深链 ?section=devices 必须在首帧就是展开态:放到 effect 里会先画一帧收起,
   // 再把下方内容顶开一格。
   const [devicesOpen, setDevicesOpen] = useState(() => isDevicesSection(location.search));
-  const relay = useSelfHostedRelayState(deviceLinkAvailable);
   const [sshOpen, setSshOpen] = useState(
     () => new URLSearchParams(location.search).get('section') === 'remoteControl.ssh',
   );
@@ -294,6 +297,10 @@ export function RemoteControlSection() {
                 focusRequestKey={focusRequestKey}
               />
             </CollapsibleSubSection>
+          </>
+        ) : null}
+        {relayAvailable ? (
+          <>
             {/* 设备之间经哪条线路连接:紧跟在「我的设备」下面直接展示,当前线路一眼可见,不再单独占一个入口。 */}
             <section id="settings-search-target-remote-relay" className="flex flex-col gap-3">
               <div className="flex flex-col gap-0.5">

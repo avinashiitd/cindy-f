@@ -5,7 +5,8 @@
  * - Bug/规则依据：appSessionState.activeOwnerScopeKey 的异步账号边界；原部署回调跨 await 读取当前账号，
  *   会将旧账号的部署记录写入新账号，切换中转在等待退出旧中转时也有同样问题。
  * - 现有覆盖缺口：部署器测试只验证 SSH 步骤，没有经过运行时 IPC 与账号切换，故单独覆盖该模块。
- * - 最小失败输入：挂起一次部署或退出请求，换账号，再让原请求完成；生成加入链接后读取发给设置页的状态。
+ * - 最小失败输入：挂起一次部署或退出请求，换账号，再让原请求完成；生成加入链接后读取发给设置页的状态；
+ *   未登录的本机模式开启本机中转。
  * - tier：unit；SSH、存储和 Electron 为进程内 fake，无网络、磁盘或真实等待。
  * - 单文件实测：1.32 秒（15 例，测试体 44ms，Windows）。
  */
@@ -19,6 +20,9 @@ import { parseRelayJoinLink } from '@cindy/device-link';
 const h = vi.hoisted(() => ({
   owner: 'account-a',
   generation: 0,
+  authenticated: true,
+  mode: 'cloud' as 'cloud' | 'local' | 'signed-out',
+  initialize: vi.fn(),
   config: new Map<string, RelayConfig>(),
   handlers: new Map<string, (event: unknown, raw: unknown) => Promise<SelfHostedRelayCommandResult>>(),
   invalidated: () => {},
@@ -38,13 +42,13 @@ vi.mock('electron', () => ({
 vi.mock('node:fs', () => ({ default: { existsSync: () => true, rmSync: vi.fn() } }));
 vi.mock('../../appSessionState.js', () => ({
   activeOwnerScopeKey: () => `${h.owner}:${h.generation}`,
-  getActiveAppSession: () => ({ mode: 'cloud', dataOwnerId: h.owner, generation: h.generation }),
+  getActiveAppSession: () => ({ mode: h.mode, dataOwnerId: h.mode === 'signed-out' ? null : h.owner, generation: h.generation }),
   isAppSessionBoundaryPending: () => false,
   onAppSessionInvalidated: (cb: () => void) => { h.invalidated = cb; },
 }));
 vi.mock('../../authManager.js', () => ({
-  getAuthState: () => ({ isAuthenticated: true }),
-  getCurrentUserId: () => h.owner,
+  getAuthState: () => ({ isAuthenticated: h.authenticated }),
+  getCurrentUserId: () => (h.authenticated ? h.owner : null),
   getDeviceId: () => 'test-device',
   onAuthStateChange: (cb: () => void) => { h.authChanged = cb; },
 }));
@@ -62,7 +66,7 @@ vi.mock('../index.js', () => ({
 }));
 vi.mock('@cindy/device-link-relay', () => ({
   createDeviceCredential: () => ({ credential: 'fake-credential' }),
-  hashSecret: () => 'fake-hash', initializeRelay: vi.fn(), startRelayServer: h.startServer,
+  hashSecret: () => 'fake-hash', initializeRelay: h.initialize, startRelayServer: h.startServer,
 }));
 vi.mock('../selfHostedRelayDeploy.js', () => ({
   bundledRelayVersion: () => RELAY_VERSION, deployRelayToServer: h.deploy, uninstallRelayFromServer: h.uninstall,
@@ -114,6 +118,8 @@ async function switchOwner(owner: string) {
 beforeEach(async () => {
   vi.useFakeTimers();
   vi.clearAllMocks();
+  h.authenticated = true;
+  h.mode = 'cloud';
   h.owner = 'account-a';
   h.generation += 1;
   h.config = new Map([['account-a', emptyConfig()], ['account-b', emptyConfig()]]);
@@ -421,4 +427,25 @@ it('hands the settings page a browser join link with the same one-time parameter
   const fromBrowser = parseRelayJoinLink(`/relay${joinLink.browserLink!.slice(joinLink.browserLink!.indexOf('#') + 1)}`);
   expect(fromBrowser).toEqual(parseRelayJoinLink(joinLink.link));
   expect(fromBrowser?.code).toBe('c'.repeat(32));
+});
+
+// 用户 2026-10-31：不登录 Cindy 账号也要能用自己的中转。原实现未登录时整个中转不可用。
+// 最小输入：本机模式（未登录）开启本机中转；完全未选择模式时仍不可用。tier: unit。
+it('lets a signed-out local-mode computer run its own relay that belongs to no account', async () => {
+  h.authenticated = false;
+  h.mode = 'local';
+  h.authChanged();
+  await vi.runAllTimersAsync();
+  expect(getState().available).toBe(true);
+  h.startServer.mockResolvedValue({ port: 47820, close: vi.fn(async () => {}) });
+  vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ name: 'Home relay' }))));
+  try {
+    const result = await command({ type: 'enable-host', port: 47820, listenAll: false, externalUrl: 'https://mac.tail.ts.net' });
+    expect(result.error).toBeUndefined();
+    expect(result.state.host.running).toBe(true);
+    expect(h.initialize).toHaveBeenCalledWith(expect.objectContaining({ ownerUserId: 'local:test-device', ownerDeviceId: 'test-device' }));
+  } finally { await command({ type: 'disable-host' }); }
+  h.mode = 'signed-out';
+  expect(getState().available).toBe(false);
+  expect((await command({ type: 'enable-host', port: 47820, listenAll: false, externalUrl: null })).error).toBe('NOT_SIGNED_IN');
 });

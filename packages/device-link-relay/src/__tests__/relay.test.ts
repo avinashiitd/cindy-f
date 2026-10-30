@@ -65,7 +65,8 @@ afterEach(async () => {
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
 });
 
-async function setup(options: { publicUrl?: string; trustProxyHeaders?: boolean; webClient?: WebAssets | false } = {}): Promise<Harness> {
+async function setup(options: { publicUrl?: string; trustProxyHeaders?: boolean; webClient?: WebAssets | false; ownerUserId?: string } = {}): Promise<Harness> {
+  const { ownerUserId = OWNER_USER, ...serverOptions } = options;
   const dataDir = await mkdtemp(path.join(os.tmpdir(), 'cindy-relay-test-'));
   const owner = createDeviceCredential();
   const ownerKey = createRelaySigningKey(crypto);
@@ -73,7 +74,7 @@ async function setup(options: { publicUrl?: string; trustProxyHeaders?: boolean;
   await initializeRelay({
     dataDir,
     name: 'Test relay',
-    ownerUserId: OWNER_USER,
+    ownerUserId,
     ownerDeviceId: OWNER_DEVICE,
     ownerDeviceName: 'Owner Mac',
     ownerCredentialHash: owner.credentialHash,
@@ -88,7 +89,7 @@ async function setup(options: { publicUrl?: string; trustProxyHeaders?: boolean;
     }),
   });
   const clock = { now: Date.UTC(2026, 9, 28) };
-  const start = () => startRelayServer({ ...options, dataDir, port: 0, now: () => clock.now });
+  const start = () => startRelayServer({ ...serverOptions, dataDir, port: 0, now: () => clock.now });
   const harness: Harness = {
     base: '',
     relayId,
@@ -694,6 +695,25 @@ describe('browser control support', () => {
     expect(wrong.json.error.code).toBe('ACCOUNT_MISMATCH');
     const web = await api(h.base, 'POST', '/api/device-link/relay/pair', { body: { ...body, code: phoneCode, platform: 'web' } });
     expect(web.status).toBe(200);
+  });
+
+  // 用户 2026-10-31：不登录 Cindy 账号也要能用自己的中转。最小输入：主人账号为 local: 的中转上，
+  // 电脑不带账号、带别的账号申请加入；对照：属于账号的中转仍按账号拒绝。
+  it('lets a relay that belongs to no account accept devices without an account match', async () => {
+    const h = await setup({ ownerUserId: 'local:owner-mac' });
+    const code = async () => (await api(h.base, 'POST', '/api/device-link/relay/admin/join-codes', { credential: h.ownerCredential })).json.code;
+    const join = async (deviceId: string, extra: Record<string, unknown>) => api(h.base, 'POST', '/api/device-link/relay/pair', {
+      body: { code: await code(), deviceId, deviceName: deviceId, platform: 'darwin', appVersion: '1.0.0', ...deviceKeys(h, deviceId), ...extra },
+    });
+    expect((await join('laptop-a', {})).status).toBe(200);
+    expect((await join('laptop-b', { accountUserId: 'someone' })).status).toBe(200);
+
+    const owned = await setup();
+    const ownedCode = (await api(owned.base, 'POST', '/api/device-link/relay/admin/join-codes', { credential: owned.ownerCredential })).json.code;
+    const refused = await api(owned.base, 'POST', '/api/device-link/relay/pair', {
+      body: { code: ownedCode, deviceId: 'laptop-c', deviceName: 'c', platform: 'darwin', appVersion: '1.0.0', ...deviceKeys(owned, 'laptop-c') },
+    });
+    expect(refused.json.error.code).toBe('ACCOUNT_MISMATCH');
   });
 
   it('authenticates a browser WebSocket by subprotocol, and REST never accepts it', async () => {

@@ -64,7 +64,8 @@ import { DEVICE_LINK_VOICE_DICTIONARY_SNAPSHOT_CHANNEL } from '@cindy/maker-shar
 import { sanitizeSourceName, type MessageSourceHostDevice } from '@cindy/maker-shared/message-source';
 import * as authManager from '../authManager';
 import { remoteCredentialHost } from '../remote-desktop/credentialHost';
-import { activeOwnerScopeKey, getActiveDataOwnerPushStamp, isAppSessionBoundaryPending } from '../appSessionState.js';
+import { activeOwnerScopeKey, getActiveDataOwnerPushStamp, isAppSessionBoundaryPending, onAppSessionInvalidated } from '../appSessionState.js';
+import { isLocalRelaySession, relaySessionReady } from './relaySession.js';
 import { createLogger } from '../logger';
 import { onQuit } from '../lifecycle';
 import { getCurrentDbClientUserId } from '../localDb/client/current';
@@ -726,7 +727,9 @@ export function initDeviceLinkService(options: DeviceLinkServiceOptions = {}): v
       // Prepare the name before the first hello without blocking Electron's main thread.
       await deviceNameReady;
       const relay = activeSelfHostedRelay();
-      if (relay) return authManager.getAuthState().isAuthenticated ? relay.credential : null;
+      if (relay) return relaySessionReady() ? relay.credential : null;
+      // 本机模式(未登录)只走自建中转,不连官方中转、不刷新账号 token。
+      if (isLocalRelaySession()) return null;
       const token = authManager.getAccessToken();
       if (token) return token;
       // 无现值(冷启动竞态/过期被清):尝试 refresh 一次,失败则跳过本轮重连
@@ -1243,7 +1246,7 @@ export function initDeviceLinkService(options: DeviceLinkServiceOptions = {}): v
     getLock: getOwnershipLock,
     onAcquire: () => {
       // 认领成功但期间已登出:不连(登出路径已 stop 仲裁,这里是 tick 竞态兜底)
-      if (!authManager.getAuthState().isAuthenticated) return;
+      if (!deviceLinkAllowed()) return;
       linkTornDown = false;
       if (client) startSharedTaskRuntime({
         client,
@@ -1263,7 +1266,7 @@ export function initDeviceLinkService(options: DeviceLinkServiceOptions = {}): v
       client?.start();
       stopNetworkWatch?.();
       stopNetworkWatch = watchNetworkChanges(() => {
-        if (linkTornDown || !arbiter?.isOwner() || !authManager.getAuthState().isAuthenticated) return;
+        if (linkTornDown || !arbiter?.isOwner() || !deviceLinkAllowed()) return;
         client?.notifyNetworkChanged();
       });
       // 可靠帧可能在 ownership 接管前到达(那时非持有者,重建被 shouldAbort 挡掉):
@@ -1291,13 +1294,30 @@ export function initDeviceLinkService(options: DeviceLinkServiceOptions = {}): v
 
   // 登录态驱动仲裁:已登录即参与认领(控制端列表/被控端可达都依赖这条 WS)
   observedAuthRealm = authManager.getActiveAuthRealm();
-  syncWithAuthState(authManager.getAuthState().isAuthenticated);
+  syncWithAuthState(deviceLinkAllowed());
   unsubscribeAuthState = authManager.onAuthStateChange((state) => {
     const nextRealm = authManager.getActiveAuthRealm();
-    const realmChanged = observedAuthRealm !== null && observedAuthRealm !== nextRealm;
+    const realmChanged = state.isAuthenticated && observedAuthRealm !== null && observedAuthRealm !== nextRealm;
     observedAuthRealm = nextRealm;
-    syncWithAuthState(state.isAuthenticated, realmChanged);
+    syncWithAuthState(deviceLinkAllowed(), realmChanged);
   });
+  // 进入 / 离开本机模式不经过登录态变化:会话提交后按最新状态参与或退出仲裁。
+  // 只处理涉及本机模式的切换;账号之间的切换仍完全由上面的登录态回调负责,行为不变。
+  let wasLocalSession = isLocalRelaySession();
+  const syncLocalSession = (attempt: number) => {
+    // 账号作用域切换还没提交完:稍后再看,避免按中间态启动或漏掉启动。
+    if (isAppSessionBoundaryPending() && attempt < 30) {
+      setTimeout(() => syncLocalSession(attempt + 1), 500).unref?.();
+      return;
+    }
+    const local = isLocalRelaySession();
+    if (local || wasLocalSession) syncWithAuthState(deviceLinkAllowed());
+    wasLocalSession = local;
+  };
+  const offSessionInvalidated = onAppSessionInvalidated(() => {
+    setTimeout(() => syncLocalSession(0), 0);
+  });
+  onQuit('device-link-local-session', offSessionInvalidated);
   onQuit('device-link', () => {
     authRealmReconnectGeneration += 1;
     unsubscribeAuthState?.();
@@ -1337,6 +1357,14 @@ export function initDeviceLinkService(options: DeviceLinkServiceOptions = {}): v
   );
 
   log.info(`device-link service initialized → ${wsUrl()}`);
+}
+
+/**
+ * 设备互联能否连接:已登录(官方或自建中转,行为不变),或本机模式下正在使用自建中转。
+ * 本机模式没有账号 token,所以只有自建中转可用;切回官方中转后不再连接。
+ */
+function deviceLinkAllowed(): boolean {
+  return authManager.getAuthState().isAuthenticated || (isLocalRelaySession() && activeSelfHostedRelay() !== null);
 }
 
 function syncWithAuthState(isAuthenticated: boolean, realmChanged = false): void {
@@ -1385,14 +1413,15 @@ function restartDeviceLinkForAuthRealmChange(): void {
  */
 export function restartDeviceLinkForRelayChange(): void {
   if (!client || !arbiter) return;
-  if (!authManager.getAuthState().isAuthenticated) return;
+  // 本机模式下切回官方中转也要走这里:拆掉自建中转的连接后不再参与仲裁。
+  if (!authManager.getAuthState().isAuthenticated && !isLocalRelaySession()) return;
   const generation = ++authRealmReconnectGeneration;
   void stopArbitrationAndTeardown()
     .catch((error) => {
       log.warn('device-link ownership release during relay switch failed', error);
     })
     .then(() => {
-      if (generation !== authRealmReconnectGeneration || !authManager.getAuthState().isAuthenticated) return;
+      if (generation !== authRealmReconnectGeneration || !deviceLinkAllowed()) return;
       arbiter?.start();
     });
 }
@@ -1544,7 +1573,7 @@ export function clearDeviceResponsiveness(deviceId: string): void {
 export function handleDeviceLinkSystemResume(): void {
   if (!client || linkTornDown) return;
   if (arbiter && !arbiter.isOwner()) return;
-  if (!authManager.getAuthState().isAuthenticated) return;
+  if (!deviceLinkAllowed()) return;
   log.info('system resume: rebuilding device-link connection immediately');
   client.restartConnection('system-resume');
 }

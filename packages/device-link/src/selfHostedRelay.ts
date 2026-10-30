@@ -26,6 +26,16 @@ const RELAY_APPS: ReadonlySet<string> = new Set(['cindy', 'cindycn', 'cindydev']
 const MAX_LINK_LENGTH = 2048;
 const JOIN_CODE_PATTERN = /^[A-Za-z0-9_-]{16,256}$/;
 const PAIR_SECRET_PATTERN = /^[A-Za-z0-9_-]{43}$/;
+/**
+ * 未登录(本机模式)开启的中转:主人账号 ID 用这个前缀加主人电脑的设备 ID 表示「这个中转不属于任何 Cindy 账号」。
+ * 这样的中转不按账号核对加入的设备;准入仍由一次性加入码、配对秘密证明与主人在电脑上的确认把关。
+ */
+export const RELAY_ACCOUNTLESS_OWNER_PREFIX = 'local:';
+
+export function isAccountlessRelayOwner(ownerUserId: string): boolean {
+  return ownerUserId.startsWith(RELAY_ACCOUNTLESS_OWNER_PREFIX);
+}
+
 /** 支持设备签名的中转在 `/relay/info` 里声明的能力。 */
 export const RELAY_SIGNATURES_FEATURE = 'device-signatures-v1';
 const API_PREFIX = '/api/device-link';
