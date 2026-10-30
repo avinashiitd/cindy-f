@@ -9,3 +9,4 @@ export type { RelayLogger } from './logger';
 export { initializeRelay, type InitializeRelayInput } from './store';
 export { readTlsFiles, startRelayServer, type RelayServerHandle, type RelayServerOptions } from './server';
 export { RELAY_VERSION } from './version';
+export { loadBundledWebAssets, type WebAsset, type WebAssets } from './webClient';

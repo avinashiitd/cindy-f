@@ -5707,6 +5707,9 @@
           "copy": "复制链接",
           "copied": "已复制加入链接",
           "newLink": "重新生成",
+          "copyBrowser": "复制浏览器链接",
+          "browserCopied": "已复制浏览器链接",
+          "browserHint": "也可以在台式机或笔记本的浏览器里打开浏览器链接,用网页控制你的电脑。",
           "waiting": "等待设备申请…"
         },
         "requests": {

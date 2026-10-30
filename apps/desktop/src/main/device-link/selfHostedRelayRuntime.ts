@@ -17,6 +17,7 @@ import os from 'node:os';
 import { app, ipcMain } from 'electron';
 import {
   acceptRelayDeviceCert,
+  buildRelayBrowserJoinLink,
   buildRelayJoinLink,
   createRelayJoinIdentity,
   createRelayPairSecret,
@@ -91,6 +92,7 @@ import {
   RelayDeployError,
   uninstallRelayFromServer,
 } from './selfHostedRelayDeploy.js';
+import { relayJoinAccountId, relayOwnerAccountId, relaySessionReady } from './relaySession.js';
 import { refreshRelayCertificatesSoon } from './selfHostedRelayFrameAuth.js';
 import { readDeviceLinkSettings } from './settings-store.js';
 import { activeOwnerScopeKey, getActiveAppSession, isAppSessionBoundaryPending, onAppSessionInvalidated } from '../appSessionState.js';
@@ -106,7 +108,7 @@ let host: RelayServerHandle | null = null;
 let hostKey: string | null = null;
 let hostError: SelfHostedRelayErrorCode | null = null;
 let hostStarting: Promise<void> | null = null;
-let joinLink: { link: string; expiresAt: number } | null = null;
+let joinLink: { link: string; browserLink?: string; expiresAt: number } | null = null;
 /** 这台电脑生成的加入链接里的配对秘密(只在内存,随链接一起过期)。 */
 let pairSecrets: Array<{ relayId: string; secret: string; expiresAt: number }> = [];
 let pendingRequests: SelfHostedRelayPairRequestView[] = [];
@@ -166,7 +168,7 @@ export function getState(): SelfHostedRelayState {
   if (joinLink && joinLink.expiresAt < Date.now()) joinLink = null;
   const bundled = bundledRelayVersion();
   return {
-    available: authManager.getAuthState().isAuthenticated && secureStorageAvailable(),
+    available: relaySessionReady() && secureStorageAvailable(),
     mode: relay ? 'self-hosted' : 'official',
     relay: relay && origin ? { name: relay.name, baseUrl: relay.baseUrl, role: relay.role, origin } : null,
     issue: issue?.kind === 'device-removed' ? 'removed' : issue?.kind === 'auth-failed' ? 'unauthorized' : null,
@@ -192,7 +194,13 @@ export function getState(): SelfHostedRelayState {
     })),
     deployJob,
     bundledRelayVersion: bundled,
-    joinLink: joinLink ? { link: joinLink.link, expiresAt: new Date(joinLink.expiresAt).toISOString() } : null,
+    joinLink: joinLink
+      ? {
+          link: joinLink.link,
+          ...(joinLink.browserLink ? { browserLink: joinLink.browserLink } : {}),
+          expiresAt: new Date(joinLink.expiresAt).toISOString(),
+        }
+      : null,
     pendingRequests,
     join,
   };
@@ -218,7 +226,7 @@ function ownerInitArgs(relayId: string, secrets: RelaySecrets, name: string) {
   return {
     name,
     relayId,
-    ownerUserId: authManager.getCurrentUserId() ?? '',
+    ownerUserId: relayOwnerAccountId() ?? '',
     ownerDeviceId,
     ownerDeviceName: deviceName().slice(0, 64) || 'Cindy',
     ownerCredentialHash: hashSecret(secrets.credential),
@@ -260,7 +268,7 @@ async function prepareHostData(dataDir: string, config: RelayConfig): Promise<st
   const stateFile = `${dataDir}/relay-state.json`;
   const existingId = config.host.relayId;
   if (existingId && readRelaySecrets(existingId) && fs.existsSync(stateFile)) return existingId;
-  if (!authManager.getCurrentUserId()) throw new Error('NOT_SIGNED_IN');
+  if (!relayOwnerAccountId()) throw new Error('NOT_SIGNED_IN');
   fs.rmSync(dataDir, { recursive: true, force: true });
   if (existingId) {
     const wasActive = readRelayConfig().active?.relayId === existingId;
@@ -453,6 +461,12 @@ async function createJoinLink(): Promise<CommandResult> {
         pairSecret,
         app: providerShareLinkApp(),
       }),
+      browserLink: buildRelayBrowserJoinLink({
+        baseUrl: base,
+        code: body.code,
+        ownerPublicKey: owner.ownerPublicKey,
+        pairSecret,
+      }),
       expiresAt,
     };
     pendingRequests = [];
@@ -507,7 +521,7 @@ type CommandResult = {
 
 function requireReady(): SelfHostedRelayErrorCode | null {
   // 账号数据作用域提交之前不能读写中转配置(否则会落进临时命名空间)。
-  if (isAppSessionBoundaryPending() || !authManager.getAuthState().isAuthenticated || !getActiveAppSession().dataOwnerId) return 'NOT_SIGNED_IN';
+  if (isAppSessionBoundaryPending() || !relaySessionReady() || !getActiveAppSession().dataOwnerId) return 'NOT_SIGNED_IN';
   if (!secureStorageAvailable()) return 'SECURE_STORAGE_UNAVAILABLE';
   return null;
 }
@@ -623,7 +637,7 @@ function startJoin(rawLink: string): CommandResult {
   const abort = new AbortController();
   joinAbort = abort;
   join = { status: 'connecting' };
-  const accountUserId = authManager.getCurrentUserId();
+  const accountUserId = relayJoinAccountId();
   const deviceId = authManager.getDeviceId();
   void (async () => {
     try {
@@ -639,7 +653,7 @@ function startJoin(rawLink: string): CommandResult {
           deviceName: deviceName(),
           platform: process.platform,
           appVersion: app.getVersion(),
-          accountUserId: accountUserId ?? '',
+          ...(accountUserId ? { accountUserId } : {}),
           publicKey: identity.publicKey,
           proof: identity.proof,
         },
@@ -652,7 +666,7 @@ function startJoin(rawLink: string): CommandResult {
       const result = await waitForRelayApproval(relayFetch, link, request, { signal: abort.signal });
       assertOwner();
       // 等待期间换了账号:凭证属于旧账号,不能写进新账号的配置。
-      if (abort.signal.aborted || authManager.getCurrentUserId() !== accountUserId) return;
+      if (abort.signal.aborted || relayJoinAccountId() !== accountUserId) return;
       // 证书必须出自链接里的主人、发给本机这把公钥;否则中转可能被人替换,不加入。
       acceptRelayDeviceCert(crypto, link, { relayId: info.relayId, deviceId, publicKey: identity.publicKey, cert: result.cert });
       // 之前加入的中转先退出(不能用 leaveCurrent:它会取消正在进行的这次加入)。
@@ -1049,7 +1063,7 @@ export function registerSelfHostedRelayIpc(): void {
   const sync = () => {
     if (retryTimer) clearTimeout(retryTimer);
     retryTimer = null;
-    const authenticated = authManager.getAuthState().isAuthenticated;
+    const authenticated = relaySessionReady();
     const ownerId = getActiveAppSession().dataOwnerId;
     if (authenticated && !ownerId && retries++ < 30) {
       retryTimer = setTimeout(sync, 1_000);

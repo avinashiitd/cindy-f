@@ -225,7 +225,8 @@ export interface SelfHostedRelayState {
   deployJob: SelfHostedRelayDeployJobView | null;
   /** 这个版本 Cindy 自带的中转版本;null = 没带(开发环境未构建)。 */
   bundledRelayVersion: string | null;
-  joinLink: { link: string; expiresAt: string } | null;
+  /** `browserLink`:同一组参数的网页加入地址(中转同源提供的浏览器控制端)。 */
+  joinLink: { link: string; browserLink?: string; expiresAt: string } | null;
   pendingRequests: SelfHostedRelayPairRequestView[];
   join: SelfHostedRelayJoinView;
 }

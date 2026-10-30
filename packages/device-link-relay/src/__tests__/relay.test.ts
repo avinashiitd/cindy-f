@@ -41,6 +41,7 @@ import WebSocket from 'ws';
 import { createDeviceCredential, initializeRelay, startRelayServer, type RelayServerHandle } from '../index';
 import { startChallengeServer } from '../certificates';
 import { DEFAULT_MEDIA_LIMITS, MediaStore } from '../media';
+import type { WebAssets } from '../webClient';
 
 const OWNER_USER = 'user-owner';
 const OWNER_DEVICE = 'owner-desktop';
@@ -64,7 +65,8 @@ afterEach(async () => {
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
 });
 
-async function setup(options: { publicUrl?: string; trustProxyHeaders?: boolean } = {}): Promise<Harness> {
+async function setup(options: { publicUrl?: string; trustProxyHeaders?: boolean; webClient?: WebAssets | false; ownerUserId?: string } = {}): Promise<Harness> {
+  const { ownerUserId = OWNER_USER, ...serverOptions } = options;
   const dataDir = await mkdtemp(path.join(os.tmpdir(), 'cindy-relay-test-'));
   const owner = createDeviceCredential();
   const ownerKey = createRelaySigningKey(crypto);
@@ -72,7 +74,7 @@ async function setup(options: { publicUrl?: string; trustProxyHeaders?: boolean 
   await initializeRelay({
     dataDir,
     name: 'Test relay',
-    ownerUserId: OWNER_USER,
+    ownerUserId,
     ownerDeviceId: OWNER_DEVICE,
     ownerDeviceName: 'Owner Mac',
     ownerCredentialHash: owner.credentialHash,
@@ -87,7 +89,7 @@ async function setup(options: { publicUrl?: string; trustProxyHeaders?: boolean 
     }),
   });
   const clock = { now: Date.UTC(2026, 9, 28) };
-  const start = () => startRelayServer({ ...options, dataDir, port: 0, now: () => clock.now });
+  const start = () => startRelayServer({ ...serverOptions, dataDir, port: 0, now: () => clock.now });
   const harness: Harness = {
     base: '',
     relayId,
@@ -646,5 +648,87 @@ describe('media relay', () => {
     expect(stored).toEqual([]);
     const get = await api(h.base, 'POST', '/api/device-link/media/presign-get', { credential: h.ownerCredential, body: { key: put.json.key } });
     expect(get.status).toBe(404);
+  });
+});
+
+describe('browser control support', () => {
+  const assets: WebAssets = new Map([
+    ['index.html', { type: 'text/html; charset=utf-8', body: Buffer.from('<!doctype html><title>web</title>') }],
+    ['app.js', { type: 'text/javascript; charset=utf-8', body: Buffer.from('console.log(1)') }],
+  ]);
+
+  it('serves the web client same-origin with a strict CSP, and only the known files', async () => {
+    const h = await setup({ webClient: assets });
+    const root = await fetch(`${h.base}/`, { redirect: 'manual' });
+    expect(root.status).toBe(302);
+    expect(root.headers.get('location')).toBe('/web/');
+    const page = await fetch(`${h.base}/web/`);
+    expect(page.status).toBe(200);
+    expect(await page.text()).toContain('<title>web</title>');
+    expect(page.headers.get('content-security-policy')).toContain("script-src 'self'");
+    expect(page.headers.get('content-security-policy')).toContain("frame-ancestors 'none'");
+    expect((await fetch(`${h.base}/web/app.js`)).headers.get('content-type')).toContain('javascript');
+    // 只提供清单里的文件:目录穿越与未知文件都是 404,API 路径不受影响。
+    for (const pathname of ['/web/../store.json', '/web/%2e%2e/secret', '/web/missing.js']) {
+      expect((await fetch(`${h.base}${pathname}`)).status).toBe(404);
+    }
+    expect((await api(h.base, 'GET', '/api/device-link/relay/info')).status).toBe(200);
+  });
+
+  it('serves no pages when the web client is disabled', async () => {
+    const h = await setup({ webClient: false });
+    expect((await fetch(`${h.base}/web/`)).status).toBe(404);
+    expect((await fetch(`${h.base}/`, { redirect: 'manual' })).status).toBe(404);
+  });
+
+  it('lets only a web browser omit the account id when requesting to join', async () => {
+    const h = await setup();
+    const code = async () => (await api(h.base, 'POST', '/api/device-link/relay/admin/join-codes', { credential: h.ownerCredential })).json.code;
+    const keys = deviceKeys(h, 'web-1');
+    const body = { deviceId: 'web-1', deviceName: 'Chrome', appVersion: '0.1.0', ...keys };
+    // 手机缺省账号:仍然拒绝,且加入码保留给正确的设备。
+    const phoneCode = await code();
+    const phone = await api(h.base, 'POST', '/api/device-link/relay/pair', { body: { ...body, code: phoneCode, platform: 'ios' } });
+    expect(phone.json.error.code).toBe('ACCOUNT_MISMATCH');
+    // 浏览器可以省略,但写了别的账号仍然拒绝。
+    const wrong = await api(h.base, 'POST', '/api/device-link/relay/pair', { body: { ...body, code: phoneCode, platform: 'web', accountUserId: 'other' } });
+    expect(wrong.json.error.code).toBe('ACCOUNT_MISMATCH');
+    const web = await api(h.base, 'POST', '/api/device-link/relay/pair', { body: { ...body, code: phoneCode, platform: 'web' } });
+    expect(web.status).toBe(200);
+  });
+
+  // 用户 2026-10-31：不登录 Cindy 账号也要能用自己的中转。最小输入：主人账号为 local: 的中转上，
+  // 电脑不带账号、带别的账号申请加入；对照：属于账号的中转仍按账号拒绝。
+  it('lets a relay that belongs to no account accept devices without an account match', async () => {
+    const h = await setup({ ownerUserId: 'local:owner-mac' });
+    const code = async () => (await api(h.base, 'POST', '/api/device-link/relay/admin/join-codes', { credential: h.ownerCredential })).json.code;
+    const join = async (deviceId: string, extra: Record<string, unknown>) => api(h.base, 'POST', '/api/device-link/relay/pair', {
+      body: { code: await code(), deviceId, deviceName: deviceId, platform: 'darwin', appVersion: '1.0.0', ...deviceKeys(h, deviceId), ...extra },
+    });
+    expect((await join('laptop-a', {})).status).toBe(200);
+    expect((await join('laptop-b', { accountUserId: 'someone' })).status).toBe(200);
+
+    const owned = await setup();
+    const ownedCode = (await api(owned.base, 'POST', '/api/device-link/relay/admin/join-codes', { credential: owned.ownerCredential })).json.code;
+    const refused = await api(owned.base, 'POST', '/api/device-link/relay/pair', {
+      body: { code: ownedCode, deviceId: 'laptop-c', deviceName: 'c', platform: 'darwin', appVersion: '1.0.0', ...deviceKeys(owned, 'laptop-c') },
+    });
+    expect(refused.json.error.code).toBe('ACCOUNT_MISMATCH');
+  });
+
+  it('authenticates a browser WebSocket by subprotocol, and REST never accepts it', async () => {
+    const h = await setup();
+    const url = `${h.base.replace(/^http/, 'ws')}/api/device-link/ws`;
+    const ws = new WebSocket(url, ['cindy-relay.v1', `cindy-credential.${h.ownerCredential}`]);
+    const protocol = await new Promise<string>((resolve, reject) => {
+      ws.on('open', () => resolve(ws.protocol));
+      ws.on('error', reject);
+    });
+    ws.close();
+    expect(protocol).toBe('cindy-relay.v1');
+    const rest = await fetch(`${h.base}/api/device-link/devices`, {
+      headers: { 'sec-websocket-protocol': `cindy-relay.v1, cindy-credential.${h.ownerCredential}` },
+    });
+    expect(rest.status).toBe(401);
   });
 });

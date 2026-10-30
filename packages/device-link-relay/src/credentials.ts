@@ -49,3 +49,21 @@ export function safeEqualHex(a: string, b: string): boolean {
 export function createVerifyCode(): string {
   return String(randomBytes(2).readUInt16BE(0) % 10_000).padStart(4, '0');
 }
+
+/** 浏览器的 WebSocket 无法设置 Authorization 头,凭证改放在 `Sec-WebSocket-Protocol` 里。 */
+export const RELAY_WS_SUBPROTOCOL = 'cindy-relay.v1';
+const RELAY_WS_CREDENTIAL_PREFIX = 'cindy-credential.';
+
+/**
+ * 解析浏览器握手的子协议:`cindy-relay.v1, cindy-credential.<凭证>`。
+ * 必须同时带版本标记和凭证才算认证;只在 WebSocket 升级里使用,REST 仍然只认 Authorization 头。
+ */
+export function parseRelayWebSocketProtocols(header: string | string[] | undefined): string | null {
+  const raw = Array.isArray(header) ? header.join(',') : header;
+  if (typeof raw !== 'string') return null;
+  const offered = raw.split(',').map((item) => item.trim()).filter(Boolean);
+  if (!offered.includes(RELAY_WS_SUBPROTOCOL)) return null;
+  const entry = offered.find((item) => item.startsWith(RELAY_WS_CREDENTIAL_PREFIX));
+  const credential = entry?.slice(RELAY_WS_CREDENTIAL_PREFIX.length);
+  return credential && /^[A-Za-z0-9_-]{16,256}$/.test(credential) ? credential : null;
+}

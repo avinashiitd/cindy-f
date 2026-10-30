@@ -5739,6 +5739,9 @@
           "copy": "Copy link",
           "copied": "Join link copied",
           "newLink": "New link",
+          "copyBrowser": "Copy browser link",
+          "browserCopied": "Browser link copied",
+          "browserHint": "Or open the browser link on a desktop or laptop to control your computers from a web browser.",
           "waiting": "Waiting for a device to ask…"
         },
         "requests": {

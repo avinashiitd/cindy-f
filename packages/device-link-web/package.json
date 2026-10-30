@@ -1,0 +1,36 @@
+{
+  "name": "@cindy/device-link-web",
+  "version": "0.0.0",
+  "private": true,
+  "description": "浏览器控制端:在网页里远程查看和控制自己的 Cindy 电脑。只连接自建中转(device-link-relay),由中转在 /web/ 同源提供;复用 @cindy/device-link 的协议与自建中转设备签名。",
+  "type": "module",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "scripts": {
+    "build": "node build.mjs",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "author": {
+    "name": "XD Inc.",
+    "email": "feedback@cindy.app"
+  },
+  "license": "Apache-2.0",
+  "dependencies": {
+    "@cindy/device-link": "workspace:*",
+    "@cindy/device-link-protocol": "workspace:*",
+    "@noble/curves": "1.9.7",
+    "@noble/hashes": "^1.8.0",
+    "@cindy/maker-shared": "workspace:*"
+  },
+  "devDependencies": {
+    "@cindy/device-link-relay": "workspace:*",
+    "@types/node": "*",
+    "@types/ws": "^8.18.1",
+    "esbuild": "^0.28.1",
+    "jsdom": "^29.1.1",
+    "typescript": "^5.7.0",
+    "vitest": "^3.2.4",
+    "ws": "^8.18.3"
+  }
+}

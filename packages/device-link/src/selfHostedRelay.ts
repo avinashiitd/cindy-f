@@ -26,6 +26,16 @@ const RELAY_APPS: ReadonlySet<string> = new Set(['cindy', 'cindycn', 'cindydev']
 const MAX_LINK_LENGTH = 2048;
 const JOIN_CODE_PATTERN = /^[A-Za-z0-9_-]{16,256}$/;
 const PAIR_SECRET_PATTERN = /^[A-Za-z0-9_-]{43}$/;
+/**
+ * 未登录(本机模式)开启的中转:主人账号 ID 用这个前缀加主人电脑的设备 ID 表示「这个中转不属于任何 Cindy 账号」。
+ * 这样的中转不按账号核对加入的设备;准入仍由一次性加入码、配对秘密证明与主人在电脑上的确认把关。
+ */
+export const RELAY_ACCOUNTLESS_OWNER_PREFIX = 'local:';
+
+export function isAccountlessRelayOwner(ownerUserId: string): boolean {
+  return ownerUserId.startsWith(RELAY_ACCOUNTLESS_OWNER_PREFIX);
+}
+
 /** 支持设备签名的中转在 `/relay/info` 里声明的能力。 */
 export const RELAY_SIGNATURES_FEATURE = 'device-signatures-v1';
 const API_PREFIX = '/api/device-link';
@@ -74,6 +84,21 @@ export function buildRelayJoinLink(input: {
   }
   const query = new URLSearchParams({ u: baseUrl, c: input.code, o: input.ownerPublicKey, s: input.pairSecret });
   return `${input.app}://${RELAY_JOIN_HOST}${RELAY_JOIN_PATH}?${query.toString()}`;
+}
+
+/**
+ * 浏览器加入链接:`<中转地址>/web/#/join?u=…&c=…&o=…&s=…`。中转在 `/web/` 同源提供网页控制端,
+ * 参数放在 `#` 之后,不会发给中转或写进访问日志;网页加入成功后立刻从地址栏清掉。参数与应用链接完全相同。
+ */
+export function buildRelayBrowserJoinLink(input: {
+  baseUrl: string;
+  code: string;
+  ownerPublicKey: string;
+  pairSecret: string;
+}): string {
+  const app = buildRelayJoinLink({ ...input, app: 'cindy' });
+  const baseUrl = normalizeRelayBaseUrl(input.baseUrl)!;
+  return `${baseUrl}/web/#/join?${app.slice(app.indexOf('?') + 1)}`;
 }
 
 /**
@@ -219,7 +244,8 @@ export async function submitRelayPairRequest(
     deviceName: string;
     platform: string;
     appVersion: string;
-    accountUserId: string;
+    /** 浏览器没有 Cindy 账号,省略;中转只对 `platform: 'web'` 接受缺省(见 device-link-relay pairing)。 */
+    accountUserId?: string;
     /** 新设备的签名公钥与配对证明,见 `createRelayJoinIdentity`。 */
     publicKey: string;
     proof: string;

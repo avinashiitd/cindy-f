@@ -5707,6 +5707,9 @@
           "copy": "複製連結",
           "copied": "已複製加入連結",
           "newLink": "重新產生",
+          "copyBrowser": "複製瀏覽器連結",
+          "browserCopied": "已複製瀏覽器連結",
+          "browserHint": "也可以在桌上型電腦或筆電的瀏覽器裡開啟瀏覽器連結,用網頁控制你的電腦。",
           "waiting": "等待裝置申請…"
         },
         "requests": {
