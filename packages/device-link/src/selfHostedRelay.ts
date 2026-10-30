@@ -77,6 +77,21 @@ export function buildRelayJoinLink(input: {
 }
 
 /**
+ * 浏览器加入链接:`<中转地址>/web/#/join?u=…&c=…&o=…&s=…`。中转在 `/web/` 同源提供网页控制端,
+ * 参数放在 `#` 之后,不会发给中转或写进访问日志;网页加入成功后立刻从地址栏清掉。参数与应用链接完全相同。
+ */
+export function buildRelayBrowserJoinLink(input: {
+  baseUrl: string;
+  code: string;
+  ownerPublicKey: string;
+  pairSecret: string;
+}): string {
+  const app = buildRelayJoinLink({ ...input, app: 'cindy' });
+  const baseUrl = normalizeRelayBaseUrl(input.baseUrl)!;
+  return `${baseUrl}/web/#/join?${app.slice(app.indexOf('?') + 1)}`;
+}
+
+/**
  * 解析加入链接。同时接受完整链接 `cindy://relay/join?...` 与路由层收到的路径形态 `/relay/join?...`
  * (Expo Router 的 native intent 只给 path)。不合法一律返回 null。
  */

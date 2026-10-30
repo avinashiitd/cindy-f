@@ -17,6 +17,7 @@ import os from 'node:os';
 import { app, ipcMain } from 'electron';
 import {
   acceptRelayDeviceCert,
+  buildRelayBrowserJoinLink,
   buildRelayJoinLink,
   createRelayJoinIdentity,
   createRelayPairSecret,
@@ -452,6 +453,12 @@ async function createJoinLink(): Promise<CommandResult> {
         ownerPublicKey: owner.ownerPublicKey,
         pairSecret,
         app: providerShareLinkApp(),
+      }),
+      browserLink: buildRelayBrowserJoinLink({
+        baseUrl: base,
+        code: body.code,
+        ownerPublicKey: owner.ownerPublicKey,
+        pairSecret,
       }),
       expiresAt,
     };

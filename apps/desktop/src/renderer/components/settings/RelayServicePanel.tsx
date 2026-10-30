@@ -310,6 +310,7 @@ function AddDevice({
   const { t } = useTranslation();
   const [qr, setQr] = useState<string | null>(null);
   const link = state.joinLink?.link ?? null;
+  const browserLink = state.joinLink?.browserLink ?? null;
   const k = 'settings.remoteControl.relay.add';
 
   useEffect(() => {
@@ -349,10 +350,22 @@ function AddDevice({
                 >
                   {t(`${k}.copy`)}
                 </Button>
+                {browserLink ? (
+                  <Button
+                    variant="secondary"
+                    size="sm"
+                    onClick={() => {
+                      void navigator.clipboard.writeText(browserLink).then(() => toast.success(t(`${k}.browserCopied`)));
+                    }}
+                  >
+                    {t(`${k}.copyBrowser`)}
+                  </Button>
+                ) : null}
                 <Button variant="secondary" size="sm" disabled={controller.busy} onClick={() => void controller.run({ type: 'create-join-link' })}>
                   {t(`${k}.newLink`)}
                 </Button>
               </div>
+              {browserLink ? <Hint>{t(`${k}.browserHint`)}</Hint> : null}
             </div>
           </div>
           {state.pendingRequests.length === 0 ? <Hint>{t(`${k}.waiting`)}</Hint> : null}

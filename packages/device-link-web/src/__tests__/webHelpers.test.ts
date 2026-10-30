@@ -7,7 +7,7 @@
  * - 附件:引用必须能被电脑端用共享解析器读回(ossKey、大小、SHA-256);落库时图片与文件分开,图片字段名必须是 originalName。
  * - tier:unit,无网络。
  */
-import { buildRelayJoinLink, createRelayPairSecret, createRelaySigningKey } from '@cindy/device-link';
+import { buildRelayBrowserJoinLink, buildRelayJoinLink, createRelayPairSecret, createRelaySigningKey } from '@cindy/device-link';
 import { nodeRelayAuthCrypto as crypto } from '@cindy/device-link/node-relay-crypto';
 import { describe, expect, it, vi } from 'vitest';
 
@@ -24,6 +24,13 @@ describe('join input', () => {
   const desktopLink = buildRelayJoinLink({
     baseUrl, code: 'c'.repeat(32), ownerPublicKey: createRelaySigningKey(crypto).publicKey,
     pairSecret: createRelayPairSecret(crypto), app: 'cindy',
+  });
+
+  it('parses the browser link Desktop hands out exactly like the app link', () => {
+    const params = { baseUrl: `${baseUrl}/`, code: 'd'.repeat(32), ownerPublicKey: createRelaySigningKey(crypto).publicKey, pairSecret: createRelayPairSecret(crypto) };
+    const browser = buildRelayBrowserJoinLink(params);
+    expect(browser.startsWith(`${baseUrl}/web/#/join?`)).toBe(true);
+    expect(parseJoinInput(browser)).toEqual(parseJoinInput(buildRelayJoinLink({ ...params, app: 'cindy' })));
   });
 
   it('accepts the desktop link, the web fragment form, and rejects anything else', () => {
