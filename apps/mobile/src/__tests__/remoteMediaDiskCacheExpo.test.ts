@@ -20,7 +20,7 @@ const io = vi.hoisted(() => ({
   resumable: vi.fn(),
   cancel: vi.fn(async () => undefined),
   deleteAsync: vi.fn(async () => undefined),
-  progress: (_value: { totalBytesWritten: number }) => {},
+  progress: (_value: { totalBytesWritten: number; totalBytesExpectedToWrite?: number }) => {},
 }));
 
 vi.mock('expo-file-system/legacy', () => ({
@@ -120,6 +120,22 @@ describe('versioned cache with the Expo adapter', () => {
 });
 
 describe('bounded temporary media downloads', () => {
+  // Tier 1: video export uses the existing cancellable transfer, including its
+  // native byte counts; mocked button tests cannot verify the adapter wiring.
+  it('forwards native progress and cancels an unfinished video export', async () => {
+    io.resumable.mockReturnValue(new Promise(() => {}));
+    const controller = new AbortController();
+    const progress = vi.fn();
+    const result = downloadRemoteMediaShareTemp('https://example.com/clip.mp4', 'video/mp4', 'video.mp4', controller.signal, progress);
+    await vi.waitFor(() => expect(io.resumable).toHaveBeenCalledOnce());
+    io.progress({ totalBytesWritten: 42, totalBytesExpectedToWrite: 100 });
+    expect(progress).toHaveBeenCalledWith(42, 100);
+    controller.abort();
+    expect(await result).toBeNull();
+    io.progress({ totalBytesWritten: 60, totalBytesExpectedToWrite: 100 });
+    expect(progress).toHaveBeenCalledOnce();
+    expect(io.cancel).toHaveBeenCalled(); expect(io.deleteAsync).toHaveBeenCalled();
+  });
   it('reports an over-limit download after cancelling and cleaning its temporary file', async () => {
     io.resumable.mockReturnValue(new Promise(() => {}));
     const onTooLarge = vi.fn();

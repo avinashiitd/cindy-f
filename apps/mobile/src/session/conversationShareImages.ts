@@ -1,4 +1,7 @@
-import { conversationShareReadableBody } from "./conversationShareRichAnswer";
+import {
+  conversationShareReadableBody,
+  conversationShareVideoSources,
+} from "./conversationShareRichAnswer";
 import {
   collectMobileMarkdownImages,
   mobileMarkdownImageUrlForWorkdir,
@@ -26,7 +29,7 @@ const IMAGE_PREPARATION_CONCURRENCY = 3;
 /** Prepare selected, visible content only; source URLs never enter the export document. */
 export async function prepareConversationShareImages(
   messages: readonly ConversationShareMessage[],
-  load: (url: string) => Promise<ConversationShareImage | null>,
+  load: (url: string, kind?: "video") => Promise<ConversationShareImage | null>,
   context: ConversationShareImageContext = {},
   isActive: () => boolean = () => true,
 ): Promise<ConversationShareMessage[]> {
@@ -43,6 +46,7 @@ export async function prepareConversationShareImages(
   >();
   let remainingCharacters = 32 * 1024 * 1024;
   let remainingPixels = MAX_EXPORT_IMAGE_PIXELS;
+  const videoUrls = new Set<string>();
   for (const message of messages) {
     if (!isActive()) return [];
     const sources = new Map<string, { url: string; occurrences: number }>();
@@ -64,6 +68,7 @@ export async function prepareConversationShareImages(
       : [message.body];
     if (message.secondaryBody) texts.push(message.secondaryBody);
     for (const text of texts) {
+      const videos = conversationShareVideoSources(message, text);
       for (const image of collectMobileMarkdownImages(
         conversationShareReadableBody(message, text),
       )) {
@@ -74,7 +79,10 @@ export async function prepareConversationShareImages(
           context.remoteHostId,
           context.sessionId,
         );
-        if (url) addSource(image.url, url);
+        if (url) {
+          addSource(image.url, url);
+          if (videos.has(image.url)) videoUrls.add(url);
+        }
       }
     }
     const images = new Map<string, ConversationShareImage>();
@@ -93,7 +101,7 @@ export async function prepareConversationShareImages(
       const [url, references] = next.value;
       let image: ConversationShareImage | null;
       try {
-        image = await load(url);
+        image = videoUrls.has(url) ? await load(url, "video") : await load(url);
       } catch {
         continue;
       }

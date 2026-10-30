@@ -73,6 +73,7 @@ import {
 export { groupWorkRuns } from './messageWorkGroups';
 export type { RenderItem, WorkChildItem } from './messageWorkGroups';
 import { useTranslation } from 'react-i18next';
+import { richAnswerMediaSources } from '@cindy/maker-shared/rich-answer';
 import {
   findMessageTodoInsertions,
   getLatestMessageTodoState,
@@ -1616,10 +1617,10 @@ export function buildRenderItems(
     return allMessages.slice(start, end);
   };
 
-  // Agent 最终正文中的 Markdown 图片是首选排版；tool_result 媒体仍保留为
+  // Agent 最终正文中的 Markdown 图片和组件媒体是首选排版；tool_result 媒体仍保留为
   // 确定性兜底。只有同一真实 user turn 内确实嵌入了同一 URL，才压掉兜底卡。
-  const inlineImageUrlsByTurnStart = new Map<number, ReadonlySet<string>>();
-  const recordTurnInlineImages = (lo: number, hi: number): void => {
+  const inlineMediaUrlsByTurnStart = new Map<number, ReadonlySet<string>>();
+  const recordTurnInlineMedia = (lo: number, hi: number): void => {
     if (hi <= lo) return;
     const urls = new Set<string>();
     for (const message of messages.slice(lo, hi)) {
@@ -1632,18 +1633,19 @@ export function buildRenderItems(
           )
         : extractRenderedMarkdownImageTargets(message.content);
       for (const url of imageTargets) urls.add(url);
+      for (const url of richAnswerMediaSources(message.content)) urls.add(url);
     }
-    inlineImageUrlsByTurnStart.set(lo, urls);
+    inlineMediaUrlsByTurnStart.set(lo, urls);
   };
   let inlineTurnStart = 0;
   for (let index = 0; index <= messages.length; index += 1) {
     const message = messages[index];
     const isBoundary = message ? isRenderTurnBoundary(message) : false;
     if (isBoundary && index > inlineTurnStart) {
-      recordTurnInlineImages(inlineTurnStart, index);
+      recordTurnInlineMedia(inlineTurnStart, index);
       inlineTurnStart = index;
     }
-    if (index === messages.length) recordTurnInlineImages(inlineTurnStart, index);
+    if (index === messages.length) recordTurnInlineMedia(inlineTurnStart, index);
   }
 
   // ── Pass 0: build toolUseId → tool_result.content lookup ──
@@ -1922,7 +1924,7 @@ export function buildRenderItems(
       for (const message of originalTurnSlice(lo, hi)) {
         if (message.role !== 'tool_result' || !isSubagentInternalMessage(message)) continue;
         for (const item of extractToolResultMedia(message.content)) {
-          if (item.kind === 'image' && inlineImageUrlsByTurnStart.get(lo)?.has(item.url)) {
+          if (inlineMediaUrlsByTurnStart.get(lo)?.has(item.url)) {
             continue;
           }
           if (seenMediaUrls.has(item.url)) continue;
@@ -2208,9 +2210,9 @@ export function buildRenderItems(
       // 提交消息被 rewind/异 ghost 伪锚)回退今日行为——本调用位置渲染。
       const collectResultMedia = (result: string): void => {
         let media = extractToolResultMedia(result);
-        const inlineImageUrls = inlineImageUrlsByTurnStart.get(turnStartIdx);
-        if (inlineImageUrls?.size) {
-          media = media.filter((item) => item.kind !== 'image' || !inlineImageUrls.has(item.url));
+        const inlineMediaUrls = inlineMediaUrlsByTurnStart.get(turnStartIdx);
+        if (inlineMediaUrls?.size) {
+          media = media.filter((item) => !inlineMediaUrls.has(item.url));
         }
         if (media.length === 0) return;
         if (isGhostCallToolName(toolName)) {

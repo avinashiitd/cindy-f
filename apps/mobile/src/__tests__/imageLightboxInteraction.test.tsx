@@ -48,6 +48,9 @@ const runtime = vi.hoisted(() => ({
 vi.mock("expo-router", () => ({
   useNavigation: () => ({ setOptions: () => undefined }),
 }));
+vi.mock('@/session/VideoDownloadButton', () => ({ VideoDownloadButton: (props: any) => {
+  runtime.nodes.set('message.videoDownload', props); return null;
+} }));
 vi.mock("react-i18next", async (importOriginal) => ({
   ...await importOriginal<typeof import('react-i18next')>(),
   useTranslation: () => ({ t: (key: string) => key }),
@@ -2166,6 +2169,10 @@ describe("chrome toggle, loading and video pages", () => {
       });
     });
     const player = runtime.nodes.get("message.imageLightboxVideoPlayer");
+    expect(runtime.nodes.get('message.videoDownload')).toMatchObject({ source: resolved.url, mimeType: 'video/mp4', immersive: true });
+    // The download toolbar must not cover the native scrubber, even if actions wrap.
+    act(() => runtime.nodes.get('message.imageLightboxVideoActions').onLayout({ nativeEvent: { layout: { height: 96 } } }));
+    expect(runtime.nodes.get('message.imageLightboxVideoPage').style.paddingBottom).toBe(runtime.insets.bottom + 96 + 24);
     expect(player.url).toBe(resolved.url);
     expect(player.visible).toBe(true);
     expect(runtime.nodes.has("message.imageLightboxShareButton")).toBe(false);

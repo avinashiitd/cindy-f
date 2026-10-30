@@ -11,6 +11,7 @@ import type {
 } from "@/session/conversationShareWebViewHtml";
 import {
   isDesktopLocalMediaUrl,
+  isDirectPreviewableMediaUrl,
   type ResolveRemoteMediaFn,
 } from "@/session/remoteMedia";
 import { withDownloadedRemoteMediaFile } from "@/session/remoteMediaDiskCacheExpo";
@@ -21,6 +22,87 @@ import {
 } from "@/session/sentAttachmentThumbStore";
 
 const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
+
+/** Decode one bounded first frame only when the user exports. Reuse the player
+ * and image encoder already shipped with the app; no persistent thumbnail store. */
+async function loadShareVideoCover(
+  url: string,
+  resolve: ResolveRemoteMediaFn,
+  canRead: () => boolean,
+  signal: AbortSignal,
+): Promise<ConversationShareImage | null> {
+  if (!canRead()) return null;
+  let uri = url;
+  let releaseSource: (() => void) | undefined;
+  if (!isDirectPreviewableMediaUrl(url)) {
+    const media = await resolve(
+      { kind: "video", url, previewable: false },
+      { signal },
+    );
+    if (
+      !canRead() ||
+      !media.previewable ||
+      !media.mimeType.startsWith("video/")
+    )
+      return null;
+    uri = media.url;
+    releaseSource = media.protectLocalFile?.();
+  }
+  let player: import("expo-video").VideoPlayer | undefined;
+  let thumbnail: import("expo-video").VideoThumbnail | undefined;
+  let context:
+    import("expo-image-manipulator").ImageManipulatorContext | undefined;
+  let image: import("expo-image-manipulator").ImageRef | undefined;
+  let savedUri: string | undefined;
+  try {
+    const { createVideoPlayer } = await import("expo-video");
+    const { ImageManipulator, SaveFormat } =
+      await import("expo-image-manipulator");
+    if (!canRead()) return null;
+    player = createVideoPlayer(null);
+    player.muted = true;
+    await player.replaceAsync(uri);
+    if (!canRead()) return null;
+    [thumbnail] = await player.generateThumbnailsAsync([0], {
+      maxWidth: 1024,
+      maxHeight: 1024,
+    });
+    if (!thumbnail || !canRead()) return null;
+    context = ImageManipulator.manipulate(thumbnail);
+    image = await context.renderAsync();
+    if (!canRead()) return null;
+    const saved = await image.saveAsync({
+      format: SaveFormat.JPEG,
+      compress: 0.85,
+      base64: true,
+    });
+    savedUri = saved.uri;
+    if (
+      !canRead() ||
+      !saved.base64 ||
+      saved.base64.length > (MAX_IMAGE_BYTES * 4) / 3
+    )
+      return null;
+    return {
+      uri: `data:image/jpeg;base64,${saved.base64}`,
+      width: saved.width,
+      height: saved.height,
+    };
+  } finally {
+    if (savedUri) {
+      try {
+        new File(savedUri).delete();
+      } catch {
+        /* OS cache cleanup */
+      }
+    }
+    image?.release();
+    context?.release();
+    thumbnail?.release();
+    player?.release();
+    releaseSource?.();
+  }
+}
 
 async function readWithShareImageCancellation<T>(
   read: () => Promise<T>,
@@ -249,11 +331,11 @@ export function useConversationShareImages(
       sourceMessages,
       // Keep completed images and all message text when the shared deadline
       // expires. Remaining images become placeholders without starting more IO.
-      (url) =>
+      (url, kind) =>
         timedOut
           ? Promise.resolve(null)
           : Promise.race([
-              loadShareImage(
+              (kind === "video" ? loadShareVideoCover : loadShareImage)(
                 url,
                 resolve,
                 () => active && !timedOut,

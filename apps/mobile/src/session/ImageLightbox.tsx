@@ -53,6 +53,7 @@ import type { MobileMessageGalleryImage } from '@/session/messageGallery';
 import { RemoteMediaPlayerWebView } from '@/session/mediaPlayerWebView';
 import type { MobileMediaPlayerStatus } from '@/session/mediaPlayerWebViewHtml';
 import { NativeVideoPlayer } from '@/session/NativeVideoPlayer';
+import { VideoDownloadButton } from '@/session/VideoDownloadButton';
 import {
   isDesktopLocalMediaUrl,
   mediaLoadFailureKey,
@@ -229,6 +230,7 @@ export const ImageLightbox = memo(function ImageLightbox({
   const { t } = useTranslation();
   const { width, height } = useWindowDimensions();
   const insets = useSafeAreaInsets();
+  const [videoToolbarHeight, setVideoToolbarHeight] = useState(64);
   const urls = useMemo(() => images.map((image) => image.url), [images]);
   const initialKeyIndex = initialImageKey ? images.findIndex((image) => image.key === initialImageKey) : -1;
   const initialIndex = initialKeyIndex >= 0 ? initialKeyIndex : lightboxInitialIndex(urls, initialUrl);
@@ -803,7 +805,9 @@ export const ImageLightbox = memo(function ImageLightbox({
               active={index === activeIndex}
               height={height}
               image={item}
-              insetBottom={insets.bottom}
+              // Keep native transport controls above the shared viewer toolbar,
+              // including wrapped actions and larger accessibility text.
+              insetBottom={insets.bottom + videoToolbarHeight + 24}
               // 让出顶部关闭 / 页码一行,系统播放控件不被压住。
               insetTop={insets.top + 64}
               onRetry={handleRetryPage}
@@ -958,8 +962,18 @@ export const ImageLightbox = memo(function ImageLightbox({
           ) : pageLabel ? (
             <Text style={styles.pageLabel} testID="message.imageLightboxPageLabel">{pageLabel}</Text>
           ) : null}
-          {isAnnotating ? null : extraActions && extraActions.length > 0 ? (
-            <View pointerEvents="box-none" style={[styles.actionBar, { bottom: insets.bottom + 12 }]}>
+          {isAnnotating ? null : activeIsVideo && !extraActions?.length ? (
+            <View pointerEvents="box-none" style={[styles.actionBar, { bottom: insets.bottom + 12 }]}
+              testID="message.imageLightboxVideoActions"
+              onLayout={event => setVideoToolbarHeight(event.nativeEvent.layout.height)}>
+              <View style={styles.actionBarPill}>
+                <VideoDownloadButton key={activeImage?.key} source={activeUri} mimeType={activeMimeType} immersive />
+              </View>
+            </View>
+          ) : extraActions && extraActions.length > 0 ? (
+            <View pointerEvents="box-none" style={[styles.actionBar, { bottom: insets.bottom + 12 }]}
+              testID={activeIsVideo ? 'message.imageLightboxVideoActions' : undefined}
+              onLayout={activeIsVideo ? event => setVideoToolbarHeight(event.nativeEvent.layout.height) : undefined}>
               <View style={styles.actionBarPill}>
                 {annotateVisible ? (
                   <Pressable
@@ -996,6 +1010,7 @@ export const ImageLightbox = memo(function ImageLightbox({
                     <Text style={styles.actionLabel}>{action.label}</Text>
                   </Pressable>
                 ))}
+                {activeIsVideo ? <VideoDownloadButton key={activeImage?.key} source={activeUri} mimeType={activeMimeType} immersive /> : null}
                 {shareVisible && !showFileHeader ? (
                   <Pressable
                     accessibilityLabel={t('message.lightbox.shareImage')}

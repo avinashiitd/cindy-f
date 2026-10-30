@@ -6633,8 +6633,8 @@ export function AttachmentStrip({
  * ToolMediaBlock — tool 产出媒体的独立视觉消息(对齐桌面 'tool_media' RenderItem):
  * agent 出的图 / 视频(lizi_art、飞书拉图等)跳出 tool_group 折叠卡,紧跟其后作为
  * 独立块渲染,用户不展开工具行也能一眼看到。图片走 attachment 变体(原始宽高比
- * contain 进 max 框,xdt-image:// 经取件队列懒取缩略图);video/audio 保持占位
- * 卡片、点开查看器播放。媒体按 url 去重(与 shared 发射判定同一口径)。
+ * contain 进 max 框,xdt-image:// 经取件队列懒取缩略图);视频共用正文的原生预览，
+ * 音频保留卡片。媒体按 url 去重(与 shared 发射判定同一口径)。
  */
 function ToolMediaBlock({
   item,
@@ -6776,7 +6776,7 @@ function PendingAttachmentImage({ layout, uri, sourceUri = uri, onError, onSize,
  * 图片:可直接预览的(http/data:)直接渲染缩略图;桌面端媒体(xdt-image://)mount 时
  * 经取件队列懒取件后渲染缩略图(取件中为同尺寸静默占位帧,失败回落占位卡片文案但
  * 保持同尺寸帧避免列表 reflow)。点击一律走 onOpen 打开 payload 查看器看原图。
- * video/audio 与非桌面端不可预览图片保持占位卡片现状。
+ * 视频与正文组件共用原生首帧预览；audio 与不可预览图片保留占位卡片。
  *
  * variant(对齐桌面版 ChatImageView 的两档):
  *   - 'card'      :工具产出媒体,固定小帧 cover 裁切;
@@ -6807,6 +6807,7 @@ function MediaPreview({
   usePreviewState?: MediaPreviewStateHook;
 }) {
   const styles = useThemedStyles(makeStyles);
+  const visible = useContext(MessageHeavyContentVisibilityContext);
   const preview = summarizeMessagePayloadPreview(buildMediaPayload(media, label));
   const durableUri = media.kind === 'image' && variant === 'attachment'
     ? getSentAttachmentThumbUri(localPreview?.sourceRef ?? media.url)
@@ -6889,6 +6890,11 @@ function MediaPreview({
     attachmentIntrinsicSizeCache.set(media.url, { width, height });
     setIntrinsicSize({ width, height });
   }, [media.url, setIntrinsicSize]);
+
+  if (media.kind === 'video' && !presentationOnly) {
+    return <InlineVideoPlayer key={media.url} url={media.url} label={label}
+      width={layout.markdownTableAvailableWidth} visible={visible} resolve={onResolveRemoteMedia} onOpen={onOpen} />;
+  }
 
   if (localUri) {
     return (
@@ -9886,7 +9892,7 @@ function RichAnswerMedia({ node, body }: { node: RichNode; body: Parameters<type
   const direct = /^(?:https?|xdt-audio|xdt-video|cindy-media):\/\//.test(raw);
   const resolveUrl = node.kind === 'video' ? mobileMarkdownImageUrlForWorkdir : mobileMarkdownManagedImagePreviewUrl;
   const url = direct ? raw : resolveUrl(raw, origin?.workdir, body.markdownImageCacheKey, origin?.remoteHostId, origin?.sessionId);
-  // Images outside workdir retain explicit-open. Video resolves only on explicit play.
+  // Images outside workdir retain explicit-open. Managed videos prepare a paused preview.
   if (!url) return <MarkdownBodyBase {...body} text={richMarkdown(node) ?? ''} streaming={false} />;
   const label = richString(node, 'alt', node.kind);
   const media: NormalizedToolMedia = { kind: node.kind, url, title: label, previewable: isDirectPreviewableMediaUrl(url) };
@@ -9906,7 +9912,8 @@ function RichAnswerMedia({ node, body }: { node: RichNode; body: Parameters<type
     mediaPreviewWidth: Math.min(body.layout.mediaPreviewWidth, width) };
   return <View style={{ minWidth: 0 }} onLayout={event => setWidth(event.nativeEvent.layout.width)}>
     {width > 0 && node.kind === 'video' ? <InlineVideoPlayer key={previewKey} url={url} label={label}
-      width={width} visible={visible} resolve={resolver} />
+      width={width} visible={visible} resolve={resolver}
+      onOpen={body.onOpenPayload ? () => body.onOpenPayload!(buildMediaPayload(media, label)) : undefined} />
       : width > 0 ? <MediaPreview key={previewKey} layout={layout} media={media} label={label} onResolveRemoteMedia={resolver}
       usePreviewState={useState}
       onOpen={body.onOpenPayload ? () => body.onOpenPayload!(buildMediaPayload(media, label)) : undefined} /> : null}

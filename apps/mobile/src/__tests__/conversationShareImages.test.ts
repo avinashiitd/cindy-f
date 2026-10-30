@@ -12,6 +12,90 @@ const image = {
 };
 
 describe("conversation share images", () => {
+  // Unit regression: sharing a visible cindy-ui video used to export only its alt
+  // text. Exercise preparation and both real exporters, including hidden tabs.
+  it.each([lightColors, darkColors])(
+    "keeps visible video covers and play marks in both exporters",
+    async (theme) => {
+      const url = "cindy-media://blobs/clip.mp4";
+      const body =
+        "```cindy-ui\n" +
+        [
+          { version: 1, seq: 1, op: "create", id: "tabs", kind: "tabs" },
+          { seq: 2, op: "create", id: "shown", parent: "tabs", kind: "stack" },
+          { seq: 3, op: "create", id: "hidden", parent: "tabs", kind: "stack" },
+          {
+            seq: 4,
+            op: "create",
+            id: "clip",
+            parent: "shown",
+            kind: "video",
+            props: { src: url, alt: "A video", caption: "Our clip" },
+          },
+          {
+            seq: 5,
+            op: "create",
+            id: "secret",
+            parent: "hidden",
+            kind: "video",
+            props: { src: "cindy-media://hidden.mp4" },
+          },
+        ]
+          .map((operation) => JSON.stringify(operation))
+          .join("\n") +
+        "\n```";
+      const load = vi.fn(async () => image);
+      const messages = await prepareConversationShareImages(
+        [{ clientId: "v", kind: "assistant", body }],
+        load,
+      );
+      expect(load).toHaveBeenCalledExactlyOnceWith(url, "video");
+      const colors = {
+        ...theme,
+        background: theme.surface,
+        codeSurface: theme.chatCodeSurface,
+        inlineCode: theme.chatInlineCodeText,
+        syntax: {},
+      };
+      const html = buildConversationShareHtml({
+        selectedMessages: messages,
+        allShareableIds: ["v"],
+        colors,
+        contentWidth: 390,
+      });
+      expect(html).toContain(image.uri);
+      expect(html).toContain("<circle");
+      expect(html).not.toContain(url);
+      expect(html).not.toContain("hidden.mp4");
+      const svg = buildConversationShareSvgLayout({
+        messages,
+        allShareableIds: ["v"],
+        colors,
+        width: 390,
+      });
+      expect(svg.images).toHaveLength(1);
+      expect(svg.images[0]?.uri).toBe(image.uri);
+      expect(
+        svg.bubbles
+          .flatMap((bubble) => bubble.vectors ?? [])
+          .flatMap((vector) => vector.vector.shapes)
+          .some((shape) => shape.type === "circle"),
+      ).toBe(true);
+      const fallback = buildConversationShareHtml({
+        selectedMessages: messages.map((message) => ({
+          ...message,
+          images: new Map(),
+        })),
+        allShareableIds: ["v"],
+        colors,
+        contentWidth: 390,
+      });
+      expect(fallback).toContain("<circle");
+      expect(fallback).toContain("Our clip");
+      expect(fallback).not.toContain(url);
+    },
+  );
+
   it("lets free workers advance across messages while the first source is stalled", async () => {
     const finishes = new Map<string, (value: typeof image | null) => void>();
     let active = 0;

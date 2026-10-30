@@ -29,6 +29,7 @@ async function downloadCancellable(
   target: File,
   signal: AbortSignal,
   maxBytes?: number,
+  onProgress?: (loaded: number, total: number) => void,
 ): Promise<File> {
   const FileSystem = await import("expo-file-system/legacy");
   let rejectStopped: (reason: Error) => void = () => undefined;
@@ -36,6 +37,7 @@ async function downloadCancellable(
     rejectStopped = reject;
   });
   const task = FileSystem.createDownloadResumable(url, target.uri, {}, (progress) => {
+    if (!signal.aborted) onProgress?.(progress.totalBytesWritten, progress.totalBytesExpectedToWrite);
     if (maxBytes !== undefined && progress.totalBytesWritten > maxBytes) {
       rejectStopped(new Error('PREVIEW_TOO_LARGE'));
       void task.cancelAsync().catch(() => undefined);
@@ -69,6 +71,7 @@ async function copyRemoteFile(
   target: File,
   signal?: AbortSignal,
   maxBytes?: number,
+  onProgress?: (loaded: number, total: number) => void,
 ): Promise<File> {
   if (url.startsWith("file://")) {
     const source = new File(url);
@@ -85,7 +88,7 @@ async function copyRemoteFile(
     target.write(Uint8Array.from(atob(match[1]), (char) => char.charCodeAt(0)));
     return target;
   }
-  if (signal || maxBytes !== undefined) return downloadCancellable(url, target, signal ?? new AbortController().signal, maxBytes);
+  if (signal || maxBytes !== undefined || onProgress) return downloadCancellable(url, target, signal ?? new AbortController().signal, maxBytes, onProgress);
   return File.downloadFileAsync(url, target, { idempotent: true });
 }
 
@@ -114,6 +117,7 @@ export async function downloadRemoteMediaShareTemp(
   mimeType: string,
   fileName?: string,
   signal?: AbortSignal,
+  onProgress?: (loaded: number, total: number) => void,
 ): Promise<string | null> {
   try {
     if (signal?.aborted) return null;
@@ -132,7 +136,7 @@ export async function downloadRemoteMediaShareTemp(
     } else {
       target = new File(dir, `share-${unique}.${extOfMime(mimeType)}`);
     }
-    const file = await copyRemoteFile(url, target, signal);
+    const file = await copyRemoteFile(url, target, signal, undefined, onProgress);
     // 直连 file:// 复制与 data: 写入无法中途停止:结束后已取消就删掉这份副本。
     if (signal?.aborted) {
       if (file.exists) file.delete();
