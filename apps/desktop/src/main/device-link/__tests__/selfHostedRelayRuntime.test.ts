@@ -5,7 +5,7 @@
  * - Bug/规则依据：appSessionState.activeOwnerScopeKey 的异步账号边界；原部署回调跨 await 读取当前账号，
  *   会将旧账号的部署记录写入新账号，切换中转在等待退出旧中转时也有同样问题。
  * - 现有覆盖缺口：部署器测试只验证 SSH 步骤，没有经过运行时 IPC 与账号切换，故单独覆盖该模块。
- * - 最小失败输入：挂起一次部署或退出请求，换账号，再让原请求完成。
+ * - 最小失败输入：挂起一次部署或退出请求，换账号，再让原请求完成；生成加入链接后读取发给设置页的状态。
  * - tier：unit；SSH、存储和 Electron 为进程内 fake，无网络、磁盘或真实等待。
  * - 单文件实测：1.32 秒（15 例，测试体 44ms，Windows）。
  */
@@ -14,6 +14,7 @@ import type { RelayConfig } from '../selfHostedRelayConfig';
 import type { SelfHostedRelayCommand, SelfHostedRelayCommandResult } from '../../../shared/selfHostedRelay';
 import { RELAY_VERSION } from '../../../../../../packages/device-link-relay/src/version';
 import { RELAY_DEPLOY_STEPS } from '../../../shared/selfHostedRelay';
+import { parseRelayJoinLink } from '@cindy/device-link';
 
 const h = vi.hoisted(() => ({
   owner: 'account-a',
@@ -403,4 +404,21 @@ it('does not remove another account’s deployment after a delayed uninstall', a
   expect(h.write).not.toHaveBeenCalled();
   expect(h.deleteSecrets).not.toHaveBeenCalled();
   expect(getState().deployJob).toBeNull();
+});
+
+// 2026-10-30：设置页要给出浏览器加入链接；原实现生成了链接，但发给设置页的状态把它丢了，按钮永远不出现。
+// 最小输入：使用自己部署的中转，生成一次加入链接，读取 getState()。tier: unit。
+it('hands the settings page a browser join link with the same one-time parameters', async () => {
+  h.deploy.mockResolvedValue({ relayVersion: '0.2.0' });
+  await command(deployCommand);
+  await vi.runAllTimersAsync();
+  await command({ type: 'use-deployment', relayId: deploymentOf()!.relayId });
+  vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({ code: 'c'.repeat(32), expiresAt: '2026-10-30T00:10:00.000Z' }))));
+  const result = await command({ type: 'create-join-link' });
+  expect(result.error).toBeUndefined();
+  const joinLink = getState().joinLink!;
+  expect(joinLink.browserLink?.startsWith('https://203.0.113.10/web/#/join?')).toBe(true);
+  const fromBrowser = parseRelayJoinLink(`/relay${joinLink.browserLink!.slice(joinLink.browserLink!.indexOf('#') + 1)}`);
+  expect(fromBrowser).toEqual(parseRelayJoinLink(joinLink.link));
+  expect(fromBrowser?.code).toBe('c'.repeat(32));
 });

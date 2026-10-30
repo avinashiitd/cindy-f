@@ -107,7 +107,7 @@ let host: RelayServerHandle | null = null;
 let hostKey: string | null = null;
 let hostError: SelfHostedRelayErrorCode | null = null;
 let hostStarting: Promise<void> | null = null;
-let joinLink: { link: string; expiresAt: number } | null = null;
+let joinLink: { link: string; browserLink?: string; expiresAt: number } | null = null;
 /** 这台电脑生成的加入链接里的配对秘密(只在内存,随链接一起过期)。 */
 let pairSecrets: Array<{ relayId: string; secret: string; expiresAt: number }> = [];
 let pendingRequests: SelfHostedRelayPairRequestView[] = [];
@@ -193,7 +193,13 @@ export function getState(): SelfHostedRelayState {
     })),
     deployJob,
     bundledRelayVersion: bundled,
-    joinLink: joinLink ? { link: joinLink.link, expiresAt: new Date(joinLink.expiresAt).toISOString() } : null,
+    joinLink: joinLink
+      ? {
+          link: joinLink.link,
+          ...(joinLink.browserLink ? { browserLink: joinLink.browserLink } : {}),
+          expiresAt: new Date(joinLink.expiresAt).toISOString(),
+        }
+      : null,
     pendingRequests,
     join,
   };
