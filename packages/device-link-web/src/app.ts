@@ -14,7 +14,7 @@ import { toDisplayMessages, type RemoteMessageRow } from './messages';
 import { agentKindOf, findModelOption, modelKey, modelOptions, needsFullAccessConfirmation, PERMISSION_MODES } from './models';
 import { clearProfile, loadProfile, saveProfile, type WebRelayProfile } from './profile';
 import type { WebAttachment } from './attachments';
-import { RemoteApi, RemoteError, type AgentKindName, type PendingInteraction, type ProviderLike, type RemoteSessionRow } from './remote';
+import { RemoteApi, RemoteError, type AgentKindName, type PendingInteraction, type ProviderLike, type RemoteSessionRow, type ScheduleRow, type ScheduleRunRow } from './remote';
 import { DEFAULT_DESKTOP_PREFERENCES, WebDesktopController, type DesktopPreferences, type DesktopSnapshot } from './desktop';
 
 const REFRESH_DEBOUNCE_MS = 300;
@@ -91,6 +91,8 @@ export function mountApp(root: HTMLElement): void {
         h('strong', {}, connection?.profile.name ?? t.title),
         connection ? h('span', { class: `pill status-${status}` }, t.status[status]) : null),
       extra ?? null,
+      connection && typeof Notification !== 'undefined' && window.isSecureContext && Notification.permission === 'default'
+        ? h('button', { class: 'btn ghost', onclick: () => void Notification.requestPermission().then(() => renderCurrent()) }, t.notifyEnable) : null,
       connection ? h('button', { class: 'btn ghost', onclick: leaveRelay }, t.leave) : null);
   }
 
@@ -196,6 +198,50 @@ export function mountApp(root: HTMLElement): void {
     }));
     showDevices();
     void refreshDevices();
+    watchActivity(profile);
+  }
+
+  /**
+   * 通知:订阅每台在线电脑的任务列表活动(轻量摘要,与手机首页同一个 topic),
+   * 任务需要处理、完成或出错时,如果不是正在看的那个任务、或页面不在前台,就弹浏览器通知。
+   * 通知只在页面开着时出现(浏览器限制;没有离线推送)。
+   */
+  function watchActivity(profile: WebRelayProfile): void {
+    const subscribed = new Set<string>();
+    const lastPhase = new Map<string, string>();
+    const titles = new Map<string, string>();
+    const ensure = () => {
+      if (!api || status !== 'online') return;
+      for (const device of devices.values()) {
+        if (device.isSelf || !device.online || !device.remoteControlEnabled || subscribed.has(device.deviceId)) continue;
+        subscribed.add(device.deviceId);
+        void api.subscribe(device.deviceId, ['sessions']).catch(() => subscribed.delete(device.deviceId));
+        void api.listSessions(device.deviceId).then((list) => list.forEach((row) => titles.set(`${device.deviceId}:${row.id}`, row.title))).catch(() => undefined);
+      }
+    };
+    const timer = setInterval(ensure, 3000);
+    offs.push(() => clearInterval(timer));
+    offs.push(connection!.client.onStatusChange((next) => { if (next !== 'online') subscribed.clear(); else ensure(); }));
+    offs.push(api!.onPush((event) => {
+      if (event.channel === 'local-db:sessions:created' || event.channel === 'local-db:sessions:patched') {
+        const row = event.payload as { id?: string; title?: string } | undefined;
+        if (row?.id && row.title) titles.set(`${event.from}:${row.id}`, row.title);
+        return;
+      }
+      if (event.channel !== 'local-db:sessions:activity') return;
+      const activity = event.payload as { sessionId?: string; phase?: string } | undefined;
+      if (!activity?.sessionId || !activity.phase) return;
+      const key = `${event.from}:${activity.sessionId}`;
+      const previous = lastPhase.get(key);
+      lastPhase.set(key, activity.phase);
+      if (previous === activity.phase || !['needs-interaction', 'completed', 'error'].includes(activity.phase)) return;
+      const watching = viewing?.deviceId === event.from && viewing.sessionId === activity.sessionId && document.visibilityState === 'visible';
+      if (watching || typeof Notification === 'undefined' || Notification.permission !== 'granted') return;
+      const label = activity.phase === 'needs-interaction' ? t.notifyNeedsYou : activity.phase === 'completed' ? t.notifyDone : t.notifyError;
+      const device = devices.get(event.from);
+      const note = new Notification(`${label} · ${titles.get(key) ?? t.notifyTask}`, { body: device?.name ?? profile.name, tag: key });
+      note.onclick = () => { window.focus(); openTask(event.from, activity.sessionId!); note.close(); };
+    }));
   }
 
   async function refreshDevices(): Promise<void> {
@@ -228,7 +274,7 @@ export function mountApp(root: HTMLElement): void {
   }
 
   // ── 工作区:左侧电脑列表,右侧任务或远程桌面(桌面浏览器的宽屏布局)─────────────
-  type Mode = 'tasks' | 'desktop' | 'files';
+  type Mode = 'tasks' | 'desktop' | 'files' | 'schedules';
   let selected: { deviceId: string; mode: Mode } | null = null;
   let pane: { dispose(): void } | null = null;
 
@@ -258,23 +304,26 @@ export function mountApp(root: HTMLElement): void {
             active ? h('div', { class: 'tabs', role: 'tablist' },
               h('button', { class: `tab${selected?.mode === 'tasks' ? ' on' : ''}`, role: 'tab', onclick: () => openDevice(device.deviceId, 'tasks') }, t.tabTasks),
               h('button', { class: `tab${selected?.mode === 'files' ? ' on' : ''}`, role: 'tab', onclick: () => openDevice(device.deviceId, 'files') }, t.tabFiles),
+              h('button', { class: `tab${selected?.mode === 'schedules' ? ' on' : ''}`, role: 'tab', onclick: () => openDevice(device.deviceId, 'schedules') }, t.tabSchedules),
               h('button', { class: `tab${selected?.mode === 'desktop' ? ' on' : ''}`, role: 'tab', onclick: () => openDevice(device.deviceId, 'desktop') }, t.tabDesktop)) : null);
         }));
     };
 
-    const openDevice = (deviceId: string, mode: Mode) => {
+    const openDevice = (deviceId: string, mode: Mode, sessionId?: string) => {
       const device = devices.get(deviceId);
       if (!device || !api) return;
-      if (selected?.deviceId === deviceId && selected.mode === mode && pane) return;
+      if (selected?.deviceId === deviceId && selected.mode === mode && pane && !sessionId) return;
       pane?.dispose();
       pane = null;
       selected = { deviceId, mode };
       paintSidebar();
-      pane = mode === 'tasks' ? mountTasks(main, device)
+      pane = mode === 'tasks' ? mountTasks(main, device, sessionId)
         : mode === 'files' ? mountFiles(main, device)
+        : mode === 'schedules' ? mountSchedules(main, device, (id) => openDevice(device.deviceId, 'tasks', id))
         : mountDesktop(main, device);
     };
 
+    openTask = (deviceId: string, sessionId: string) => openDevice(deviceId, 'tasks', sessionId);
     teardownWorkspace?.();
     teardownWorkspace = () => { pane?.dispose(); pane = null; };
     setView(() => {
@@ -288,9 +337,12 @@ export function mountApp(root: HTMLElement): void {
     }, () => { teardownWorkspace?.(); teardownWorkspace = null; });
   }
   let teardownWorkspace: (() => void) | null = null;
+  let openTask: (deviceId: string, sessionId: string) => void = () => undefined;
+  /** 正在看的任务:通知只提醒别的任务,或页面不在前台时。 */
+  let viewing: { deviceId: string; sessionId: string } | null = null;
 
   // ── 任务:左边任务列表,右边所选任务的对话 ─────────────────────────────────────
-  function mountTasks(container: HTMLElement, device: DeviceView): { dispose(): void } {
+  function mountTasks(container: HTMLElement, device: DeviceView, initialSessionId?: string): { dispose(): void } {
     let sessions: RemoteSessionRow[] = [];
     let failed = false;
     let alive = true;
@@ -391,8 +443,15 @@ export function mountApp(root: HTMLElement): void {
       chat?.dispose();
       activeId = session.id;
       paintList();
-      chat = mountChat(chatEl, device, session);
+      chat = mountChat(chatEl, device, session, () => {
+        chat?.dispose(); chat = null; activeId = null;
+        replaceChildren(chatEl, h('p', { class: 'note empty' }, t.selectTask));
+        void load();
+      });
     };
+    if (initialSessionId) {
+      void api?.getSession(device.deviceId, initialSessionId).then((session) => { if (alive && session) openChat(session); }).catch(() => undefined);
+    }
 
     const off = api?.onPush((event) => {
       if (event.from === device.deviceId && event.channel.startsWith('local-db:sessions:')) schedule();
@@ -401,13 +460,13 @@ export function mountApp(root: HTMLElement): void {
     void load();
     return {
       dispose() {
+        // 'sessions' 订阅由全局的通知监听持有,这里不退订。
         alive = false; clearTimeout(timer); off?.(); chat?.dispose();
-        void api?.unsubscribe(device.deviceId, ['sessions']).catch(() => undefined);
       },
     };
   }
 
-  function mountChat(container: HTMLElement, device: DeviceView, initial: RemoteSessionRow): { dispose(): void } {
+  function mountChat(container: HTMLElement, device: DeviceView, initial: RemoteSessionRow, onArchived?: () => void): { dispose(): void } {
     let session = initial;
     let rows: RemoteMessageRow[] = [];
     let interactions: PendingInteraction[] = [];
@@ -448,6 +507,18 @@ export function mountApp(root: HTMLElement): void {
     const runBadge = h('span', { class: 'pill ok' }, t.running);
     const stopButton = h('button', { class: 'btn', onclick: () => api && void api.stop(device.deviceId, session.id).then(load, load) }, t.stop);
     const titleEl = h('h1', {}, session.title || session.id);
+    viewing = { deviceId: device.deviceId, sessionId: session.id };
+    const renameButton = h('button', { class: 'btn ghost', onclick: async () => {
+      const title = window.prompt(t.taskRenamePrompt, session.title)?.trim();
+      if (!title || !api || title === session.title) return;
+      try { await api.patchSession(device.deviceId, session.id, { title }); } catch (e) { error = t.settingFailed + (e instanceof Error ? e.message : ''); }
+      await load();
+    } }, t.taskRename);
+    const archiveButton = h('button', { class: 'btn ghost', onclick: async () => {
+      if (!api || !window.confirm(t.taskArchiveConfirm)) return;
+      try { await api.patchSession(device.deviceId, session.id, { status: 'archived' }); onArchived?.(); }
+      catch (e) { error = t.settingFailed + (e instanceof Error ? e.message : ''); await load(); }
+    } }, t.taskArchive);
     let providers: ProviderLike[] = [];
     const controls = h('div', { class: 'row controls' });
     const setting = async (action: () => Promise<unknown>) => {
@@ -612,7 +683,7 @@ export function mountApp(root: HTMLElement): void {
       if (event.channel.startsWith('maker:') || event.channel.startsWith('local-db:messages:') || event.channel.startsWith('local-db:sessions:')) schedule();
     });
     const chatEl = h('div', { class: 'chat' },
-      h('div', { class: 'row between' }, titleEl, h('div', { class: 'row' }, runBadge, stopButton)),
+      h('div', { class: 'row between' }, titleEl, h('div', { class: 'row' }, runBadge, stopButton, renameButton, archiveButton)),
       controls, log, side, chips,
       h('div', { class: 'row composer-row' },
         h('button', { class: 'btn ghost', onclick: () => filePicker.click(), 'aria-label': t.attach, title: t.attach }, '📎'), filePicker,
@@ -633,6 +704,7 @@ export function mountApp(root: HTMLElement): void {
     return {
       dispose() {
         alive = false; clearTimeout(timer); off?.();
+        if (viewing?.sessionId === session.id) viewing = null;
         void api?.unsubscribe(device.deviceId, [topic]).catch(() => undefined);
       },
     };
@@ -724,6 +796,118 @@ export function mountApp(root: HTMLElement): void {
       if (list[0] && !folder.value) { folder.value = list[0].path; workdir = list[0].path; void openDir(); }
     }).catch(() => undefined);
     return { dispose() { alive = false; download?.abort(); } };
+  }
+
+  // ── 定时任务 ─────────────────────────────────────────────────────────────
+  function mountSchedules(container: HTMLElement, device: DeviceView, openSession: (sessionId: string) => void): { dispose(): void } {
+    let alive = true;
+    let schedules: ScheduleRow[] = [];
+    let failed = false;
+    const listEl = h('div', { class: 'task-list' });
+    const detailEl = h('div', { class: 'task-chat' }, h('p', { class: 'note empty' }, t.selectTask));
+    replaceChildren(container, h('div', { class: 'split' }, listEl, detailEl));
+    const when = (ms: number | null | undefined) => (ms ? new Date(ms).toLocaleString() : '—');
+    const act = async (action: 'run-now' | 'pause' | 'resume' | 'delete', schedule: ScheduleRow) => {
+      if (!api) return;
+      if (action === 'delete' && !window.confirm(t.scheduleDeleteConfirm)) return;
+      try { await api.scheduleAction(device.deviceId, action, schedule.id); } catch (e) { window.alert(t.settingFailed + (e instanceof Error ? e.message : '')); }
+      await load();
+      if (action !== 'delete') void showDetail(schedule.id);
+      else replaceChildren(detailEl, h('p', { class: 'note empty' }, t.selectTask));
+    };
+    const paintList = () => replaceChildren(listEl,
+      h('div', { class: 'row between' }, h('h2', { class: 'side-title' }, t.schedules),
+        h('div', { class: 'row' }, h('button', { class: 'btn ghost', onclick: () => void load() }, t.refresh),
+          h('button', { class: 'btn primary', onclick: () => void showCreate() }, t.scheduleNew))),
+      failed ? h('p', { class: 'note error' }, t.loadFailed) : null,
+      !failed && schedules.length === 0 ? h('p', { class: 'note' }, t.noSchedules) : null,
+      h('ul', { class: 'list' }, ...schedules.map((schedule) => h('li', {},
+        h('button', { class: 'item', onclick: () => void showDetail(schedule.id) },
+          h('span', { class: 'item-main' }, h('strong', {}, schedule.name),
+            h('span', { class: 'sub' }, schedule.manual ? t.scheduleManual : schedule.cronExpr ?? ''),
+            h('span', { class: 'sub' }, schedule.status === 'paused' ? t.schedulePaused : `${t.scheduleNext}: ${when(schedule.nextFireAt)}`)))))));
+    const load = async () => {
+      if (!api) return;
+      try { schedules = await api.listSchedules(device.deviceId); failed = false; } catch { failed = true; }
+      if (alive) paintList();
+    };
+    const showDetail = async (id: string) => {
+      const schedule = schedules.find((s) => s.id === id);
+      if (!schedule || !api) return;
+      let runs: ScheduleRunRow[] = [];
+      try { runs = await api.listScheduleRuns(device.deviceId, id); } catch { runs = []; }
+      if (!alive) return;
+      replaceChildren(detailEl, h('div', { class: 'chat' },
+        h('div', { class: 'row between' }, h('h1', {}, schedule.name),
+          h('div', { class: 'row' },
+            h('button', { class: 'btn primary', onclick: () => void act('run-now', schedule) }, t.scheduleRunNow),
+            schedule.status === 'paused'
+              ? h('button', { class: 'btn', onclick: () => void act('resume', schedule) }, t.scheduleResume)
+              : h('button', { class: 'btn', onclick: () => void act('pause', schedule) }, t.schedulePause),
+            h('button', { class: 'btn ghost', onclick: () => void act('delete', schedule) }, t.scheduleDelete))),
+        h('p', { class: 'sub' }, `${schedule.manual ? t.scheduleManual : schedule.cronExpr ?? ''} · ${t.scheduleNext}: ${when(schedule.nextFireAt)} · ${t.scheduleLast}: ${when(schedule.lastFiredAt)}`),
+        schedule.workingDir ? h('p', { class: 'sub' }, schedule.workingDir) : null,
+        h('div', { class: 'card' }, h('div', { class: 'md' }, renderMarkdown(schedule.prompt))),
+        h('h2', { class: 'side-title' }, t.scheduleRuns),
+        h('ul', { class: 'list' }, ...runs.map((run) => h('li', {},
+          h('div', { class: 'item run' },
+            h('span', { class: 'item-main' }, h('strong', {}, `${run.status} · ${when(run.firedAt)}`),
+              run.resultText ? h('span', { class: 'sub clamp' }, run.resultText) : null),
+            run.sessionId ? h('button', { class: 'btn ghost', onclick: () => openSession(run.sessionId!) }, t.scheduleOpenTask) : null))))));
+    };
+    const showCreate = async () => {
+      if (!api) return;
+      const [providersRaw, workdirs] = await Promise.all([
+        api.listProviders(device.deviceId).catch(() => ({ providers: [] as ProviderLike[] })),
+        api.recentWorkdirs(device.deviceId).catch(() => [] as Array<{ path: string }>),
+      ]);
+      if (!alive) return;
+      const options = modelOptions(providersRaw.providers, 'claude-code');
+      const name = h('input', { id: 'sc-name', type: 'text' });
+      const prompt = h('textarea', { id: 'sc-prompt', rows: 4 });
+      const presets: Array<[string, string]> = [['0 * * * *', t.scheduleHourly], ['0 9 * * *', t.scheduleDaily], ['0 9 * * 1-5', t.scheduleWeekdays], ['custom', t.scheduleCustom], ['manual', t.scheduleManual]];
+      const preset = h('select', { id: 'sc-when' }, ...presets.map(([v, label]) => h('option', { value: v }, label)));
+      preset.value = '0 9 * * *';
+      const cron = h('input', { id: 'sc-cron', type: 'text', value: '0 9 * * *', spellcheck: false });
+      cron.disabled = true;
+      preset.addEventListener('change', () => {
+        cron.disabled = preset.value !== 'custom';
+        if (preset.value !== 'custom' && preset.value !== 'manual') cron.value = preset.value;
+      });
+      const model = h('select', { id: 'sc-model' }, ...options.map((o) => h('option', { value: o.key }, o.label)));
+      const folder = h('input', { id: 'sc-folder', type: 'text', list: 'sc-folders', autocomplete: 'off', spellcheck: false });
+      if (workdirs[0]) folder.value = workdirs[0].path;
+      const message = h('p', { class: 'note', role: 'status' });
+      const create = h('button', { class: 'btn primary', onclick: async () => {
+        const chosen = options.find((o) => o.key === model.value);
+        if (!name.value.trim() || !prompt.value.trim() || !folder.value.trim() || !chosen) return;
+        const manual = preset.value === 'manual';
+        try {
+          await api!.createSchedule(device.deviceId, {
+            name: name.value.trim(), prompt: prompt.value.trim(), kind: 'cron', cronExpr: manual ? '0 9 * * *' : cron.value.trim(),
+            timezone: Intl.DateTimeFormat().resolvedOptions().timeZone, recurring: true, manual,
+            agentKind: 'claude-code', model: chosen.modelId, providerId: chosen.providerId, workspaceKind: 'project',
+            workingDir: folder.value.trim(), useWorktree: false, notify: { desktop: true, feishu: false },
+          });
+          await load();
+          replaceChildren(detailEl, h('p', { class: 'note empty' }, t.selectTask));
+        } catch (e) { message.className = 'note error'; message.textContent = t.newTaskFailed + (e instanceof Error ? e.message : ''); }
+      } }, t.scheduleCreate);
+      replaceChildren(detailEl, h('div', { class: 'chat newtask' }, h('h1', {}, t.scheduleNew),
+        h('label', { for: 'sc-name' }, t.scheduleName), name,
+        h('label', { for: 'sc-prompt' }, t.schedulePrompt), prompt,
+        h('label', { for: 'sc-when' }, t.scheduleWhen), preset,
+        h('label', { for: 'sc-cron' }, t.scheduleCron), cron,
+        h('label', { for: 'sc-model' }, t.newTaskModel), model,
+        h('label', { for: 'sc-folder' }, t.newTaskFolder), folder,
+        h('datalist', { id: 'sc-folders' }, ...workdirs.slice(0, 30).map((w) => h('option', { value: w.path }))),
+        h('div', { class: 'row' }, create), message));
+    };
+    const off = api?.onPush((event) => {
+      if (event.from === device.deviceId && event.channel === 'maker:schedule:event') void load();
+    });
+    void load();
+    return { dispose() { alive = false; off?.(); } };
   }
 
   // ── 远程桌面 ────────────────────────────────────────────────────────────

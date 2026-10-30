@@ -71,6 +71,28 @@ const LIST_LIMIT = 100;
 const ONLINE_WAIT_MS = 15_000;
 const EXPORT_POLL_MS = 700;
 
+export interface ScheduleRow {
+  id: string;
+  name: string;
+  prompt: string;
+  status: 'active' | 'paused' | 'expired' | string;
+  cronExpr?: string;
+  manual?: boolean;
+  recurring?: boolean;
+  workingDir?: string | null;
+  nextFireAt?: number | null;
+  lastFiredAt?: number | null;
+}
+
+export interface ScheduleRunRow {
+  id: string;
+  sessionId?: string | null;
+  status: string;
+  firedAt: number;
+  finishedAt?: number | null;
+  resultText?: string | null;
+}
+
 export interface RemoteDirEntry {
   name: string;
   relPath: string;
@@ -302,6 +324,28 @@ export class RemoteApi {
       if (status.state === 'done' && status.key) return this.mediaDownloadUrl(status.key);
       await new Promise((resolve) => setTimeout(resolve, EXPORT_POLL_MS));
     }
+  }
+
+  // ── 任务管理与定时任务 ────────────────────────────────────────────────────
+  /** 改名、归档(status: 'archived')、置顶;与手机同一个 channel。 */
+  patchSession(deviceId: string, sessionId: string, patch: { title?: string; status?: 'active' | 'archived'; pinnedAt?: string | null }): Promise<RemoteSessionRow> {
+    return this.invoke(deviceId, 'local-db:sessions:patch-meta', [sessionId, patch]);
+  }
+
+  listSchedules(deviceId: string): Promise<ScheduleRow[]> {
+    return this.invoke(deviceId, 'maker:schedule:list', []);
+  }
+
+  createSchedule(deviceId: string, input: Record<string, unknown>): Promise<ScheduleRow> {
+    return this.invoke(deviceId, 'maker:schedule:create', [input]);
+  }
+
+  scheduleAction(deviceId: string, action: 'run-now' | 'pause' | 'resume' | 'delete', id: string): Promise<unknown> {
+    return this.invoke(deviceId, `maker:schedule:${action}`, [id]);
+  }
+
+  listScheduleRuns(deviceId: string, id: string, limit = 20): Promise<ScheduleRunRow[]> {
+    return this.invoke(deviceId, 'maker:schedule:list-runs', [id, limit]);
   }
 
   /** 被控端转发来的 push 事件(`maker:event`、`local-db:messages:created` 等)。 */

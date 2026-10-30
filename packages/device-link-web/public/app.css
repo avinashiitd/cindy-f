@@ -198,3 +198,6 @@ textarea, input[type=text], input:not([type]) {
 .file-preview { min-width: 0; padding: 12px 16px; overflow: auto; display: flex; flex-direction: column; gap: 8px; }
 .file-text { margin: 0; white-space: pre; overflow: auto; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12.5px;
   border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; background: var(--surface); }
+.item.run { cursor: default; }
+.tabs { flex-wrap: wrap; }
+.tab { flex: 1 1 auto; white-space: nowrap; }
