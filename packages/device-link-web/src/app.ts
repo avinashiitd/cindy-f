@@ -604,6 +604,7 @@ export function mountApp(root: HTMLElement): void {
         const raw = JSON.parse(storage?.getItem(prefKey) ?? 'null') as Partial<DesktopPreferences> | null;
         return {
           lockOnExit: raw?.lockOnExit !== false,
+          privacyScreen: raw?.privacyScreen !== false,
           idleTimeoutMinutes: ([0, 1, 5, 10, 15, 30] as number[]).includes(raw?.idleTimeoutMinutes as number)
             ? raw!.idleTimeoutMinutes as DesktopPreferences['idleTimeoutMinutes'] : DEFAULT_DESKTOP_PREFERENCES.idleTimeoutMinutes,
           audio: raw?.audio === true,
@@ -623,7 +624,97 @@ export function mountApp(root: HTMLElement): void {
         h('button', { id: 'mouse-wheel', type: 'button' }, h('span', { id: 'mouse-wheel-grip' }))),
       overlay);
     const toolbar = h('div', { class: 'viewer-toolbar' });
-    replaceChildren(container, h('div', { class: 'viewer' }, toolbar, content));
+    const tools = h('div', { class: 'viewer-toolbar secondary' });
+    const notice = h('div', { class: 'viewer-notice', role: 'status', hidden: true });
+    replaceChildren(container, h('div', { class: 'viewer' }, toolbar, tools, notice, content));
+    let noticeTimer: ReturnType<typeof setTimeout> | undefined;
+    const say = (text: string, extra?: Node) => {
+      clearTimeout(noticeTimer);
+      replaceChildren(notice, h('span', {}, text), extra ?? null, h('button', { class: 'btn ghost', onclick: () => { notice.hidden = true; } }, '×'));
+      notice.hidden = false;
+      if (!extra) noticeTimer = setTimeout(() => { notice.hidden = true; }, 5000);
+    };
+    const clipboardError = (e: unknown) => {
+      const code = e instanceof Error ? e.message : '';
+      say(code.includes('EMPTY') ? t.desktopClipboardEmpty : code.includes('TOO_LONG') ? t.desktopClipboardTooLong : t.desktopClipboardFailed);
+    };
+    // 剪贴板:能用异步剪贴板 API(https)就直接读写,否则退回手动复制 / 输入框。
+    const copyFromRemote = async () => {
+      try {
+        const text = await controller!.copyFromRemote();
+        try { await navigator.clipboard.writeText(text); say(t.desktopCopied); }
+        catch {
+          const area = h('textarea', { class: 'manual-copy', rows: 4, readonly: true });
+          area.value = text;
+          say(t.desktopClipboardManual, area);
+          area.select();
+        }
+      } catch (e) { clipboardError(e); }
+    };
+    const pasteToRemote = async () => {
+      let text: string | null = null;
+      try { text = await navigator.clipboard.readText(); } catch { text = window.prompt(t.desktopPastePrompt) ?? null; }
+      if (text === null) return;
+      try { await controller!.pasteToRemote(text); say(t.desktopPasted); } catch (e) { clipboardError(e); }
+    };
+    const mac = (caps: DesktopSnapshot['caps']) => caps?.platform === 'darwin';
+    const keyCombos = (caps: DesktopSnapshot['caps']): Array<[string, string[]]> => mac(caps)
+      ? [['⌘ Tab', ['MetaLeft', 'Tab']], ['⌘ Space', ['MetaLeft', 'Space']], ['⌘ Q', ['MetaLeft', 'KeyQ']], ['⌘ W', ['MetaLeft', 'KeyW']], ['⌃ ⌘ Q (lock)', ['ControlLeft', 'MetaLeft', 'KeyQ']]]
+      : [['Ctrl+Alt+Delete', ['ControlLeft', 'AltLeft', 'Delete']], ['Alt+Tab', ['AltLeft', 'Tab']], ['Alt+F4', ['AltLeft', 'F4']], ['Win', ['MetaLeft']], ['Ctrl+W', ['ControlLeft', 'KeyW']], ['Ctrl+Esc', ['ControlLeft', 'Escape']]];
+    let modes: Awaited<ReturnType<WebDesktopController['displayModes']>> = [];
+    let windows: Awaited<ReturnType<WebDesktopController['listWindows']>> = [];
+    let modesLease = '';
+    const paintTools = (state: DesktopSnapshot) => {
+      const caps = state.caps;
+      const can = state.ready && state.controlling;
+      const combos = keyCombos(caps);
+      const keysSelect = h('select', { 'aria-label': t.desktopKeys, disabled: !can },
+        h('option', { value: '' }, t.desktopKeys), ...combos.map(([label], i) => h('option', { value: String(i) }, label)));
+      keysSelect.addEventListener('change', () => {
+        const combo = combos[Number(keysSelect.value)];
+        if (combo) controller?.keys(combo[1]);
+        keysSelect.value = '';
+      });
+      const modeSelect = caps?.displayModes && caps.resolutionRestore ? h('select', { 'aria-label': t.desktopResolution, disabled: !can || state.busy },
+        h('option', { value: '' }, t.desktopResolution),
+        ...modes.map((m) => h('option', { value: m.id }, `${m.width} × ${m.height}${m.current ? ' ✓' : ''}`))) : null;
+      modeSelect?.addEventListener('focus', () => void loadModes(true));
+      modeSelect?.addEventListener('change', () => {
+        const mode = modes.find((m) => m.id === modeSelect.value);
+        if (mode) void controller?.resolution(mode).then(() => loadModes(true)).catch(() => say(t.desktopErrors.failed));
+      });
+      const windowSelect = caps?.windowActions ? h('select', { 'aria-label': t.desktopWindows, disabled: !can },
+        h('option', { value: '' }, t.desktopWindows),
+        h('option', { value: '__desktop' }, t.desktopShowDesktop),
+        ...windows.map((w) => h('option', { value: w.id }, `${w.app}${w.title ? ` — ${w.title}` : ''}`.slice(0, 80)))) : null;
+      windowSelect?.addEventListener('focus', () => void controller?.listWindows().then((list) => { windows = list; paintTools(controller!.snapshot); }).catch(() => undefined));
+      windowSelect?.addEventListener('change', () => {
+        const id = windowSelect.value;
+        if (id === '__desktop') void controller?.showDesktop().catch(() => undefined);
+        else if (id) void controller?.activateWindow(id).catch(() => undefined);
+        windowSelect.value = '';
+      });
+      replaceChildren(tools,
+        h('button', { class: 'btn ghost', onclick: () => controller?.zoom('out'), disabled: !state.ready, 'aria-label': t.desktopZoomOut }, '−'),
+        h('button', { class: 'btn ghost', onclick: () => controller?.zoom('in'), disabled: !state.ready, 'aria-label': t.desktopZoomIn }, '+'),
+        caps?.clipboardText !== false ? h('button', { class: 'btn ghost', onclick: () => void copyFromRemote(), disabled: !can }, t.desktopCopy) : null,
+        caps?.clipboardText !== false ? h('button', { class: 'btn ghost', onclick: () => void pasteToRemote(), disabled: !can }, t.desktopPaste) : null,
+        keysSelect, modeSelect, windowSelect,
+        caps?.privacyScreen ? h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: state.privacy ?? state.preferences.privacyScreen, disabled: !can,
+          onchange: (e: Event) => controller?.preferences({ privacyScreen: (e.target as HTMLInputElement).checked }) }), t.desktopPrivacy) : null,
+        caps?.hostMute ? h('label', { class: 'check' }, h('input', { type: 'checkbox', checked: state.hostMuted === true, disabled: !can,
+          onchange: (e: Event) => void controller?.setHostMute((e.target as HTMLInputElement).checked).catch(() => say(t.desktopErrors.failed)) }), t.desktopHostMute) : null);
+    };
+    const loadModes = async (force = false) => {
+      const snap = controller?.snapshot;
+      if (!controller || !snap?.ready || !snap.caps?.displayModes) return;
+      if (!force && modesLease === snap.displayId) return;
+      modesLease = snap.displayId;
+      try { modes = await controller.displayModes(); } catch { modes = []; }
+      if (controller) paintTools(controller.snapshot);
+    };
+    const onVisibility = () => controller?.setHidden(document.visibilityState === 'hidden');
+    document.addEventListener('visibilitychange', onVisibility);
 
     let controller: WebDesktopController | null = null;
     const select = (id: string, label: string, options: Array<[string, string]>, value: string, onChange: (v: string) => void) => {
@@ -689,14 +780,19 @@ export function mountApp(root: HTMLElement): void {
     controller = new WebDesktopController(api!, device.deviceId, content, loadPrefs(), (state) => {
       try { storage?.setItem(prefKey, JSON.stringify(state.preferences)); } catch { /* 偏好只是便利。 */ }
       paintToolbar(state);
+      paintTools(state);
       paintOverlay(state);
+      if (state.ready) void loadModes();
     });
     paintToolbar(controller.snapshot);
+    paintTools(controller.snapshot);
     paintOverlay(controller.snapshot);
     stage.focus();
     return {
       dispose() {
         document.removeEventListener('fullscreenchange', onFullscreen);
+        document.removeEventListener('visibilitychange', onVisibility);
+        clearTimeout(noticeTimer);
         const current = controller;
         controller = null;
         if (current) void current.close();

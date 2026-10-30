@@ -15,13 +15,17 @@ import {
   REMOTE_DESKTOP_CHANNEL,
   REMOTE_DESKTOP_CONNECTION_TIMEOUT_MS,
   REMOTE_DESKTOP_ICE_SERVERS,
+  REMOTE_DESKTOP_MAX_CLIPBOARD_CHARS,
   REMOTE_DESKTOP_MAX_FRAME_BYTES,
   REMOTE_DESKTOP_NETWORK,
   remoteDesktopFailureKey,
   RemoteDesktopViewerMedia,
   RemoteDesktopViewerSession,
   resolveDesktopIceServers,
+  type DesktopInput,
   type RemoteDesktopCapabilities,
+  type RemoteDesktopDisplayMode,
+  type RemoteDesktopWindow,
   type RemoteDesktopRequest,
   type RemoteDesktopVideoSettings,
 } from '@cindy/device-link';
@@ -34,11 +38,13 @@ export type IdleMinutes = 0 | 1 | 5 | 10 | 15 | 30;
 
 export interface DesktopPreferences {
   lockOnExit: boolean;
+  /** 控制时遮住被控电脑本地显示器(与 Desktop 查看窗口默认一致:开)。 */
+  privacyScreen: boolean;
   idleTimeoutMinutes: IdleMinutes;
   audio: boolean;
 }
 
-export const DEFAULT_DESKTOP_PREFERENCES: DesktopPreferences = { lockOnExit: true, idleTimeoutMinutes: 5, audio: false };
+export const DEFAULT_DESKTOP_PREFERENCES: DesktopPreferences = { lockOnExit: true, privacyScreen: true, idleTimeoutMinutes: 5, audio: false };
 
 export interface DesktopSnapshot {
   status: DesktopStatus;
@@ -53,6 +59,11 @@ export interface DesktopSnapshot {
   settings: RemoteDesktopVideoSettings;
   preferences: DesktopPreferences;
   scaleMode: 'fit' | 'actual' | 'custom';
+  /** 被控电脑的隐私屏幕(本地显示器遮挡)与静音状态;null = 未知 / 不支持。 */
+  privacy: boolean | null;
+  hostMuted: boolean | null;
+  /** 正在切换分辨率等,期间不接受新的显示变化。 */
+  busy: boolean;
 }
 
 const CONNECTION_BUDGET_MS = REMOTE_DESKTOP_CONNECTION_TIMEOUT_MS;
@@ -78,6 +89,9 @@ export class WebDesktopController {
   private offers = 0;
   private pendingSettings = false;
   private mediaChanging = false;
+  private hidden = false;
+  private videoHidden = false;
+  private hiddenBusy = false;
 
   constructor(
     private readonly api: RemoteApi,
@@ -89,7 +103,7 @@ export class WebDesktopController {
     this.state = {
       status: 'connecting', error: null, caps: null, displayId: '', controlling: false, ready: false,
       transport: '', latency: null, settings: { fps: 30, quality: 'auto', audio: preferences.audio },
-      preferences, scaleMode: 'fit',
+      preferences, scaleMode: 'fit', privacy: null, hostMuted: null, busy: false,
     };
     this.session = new RemoteDesktopViewerSession(this.request);
     this.media = new RemoteDesktopViewerMedia({
@@ -211,7 +225,8 @@ export class WebDesktopController {
     this.runtime?.receive({ type: 'releaseInput' });
     void this.session.stop(false, preserveLease).catch(() => undefined);
     this.runtime?.receive({ type: 'stop', preserveFrame });
-    this.publish({ controlling: false, ready: false, transport: '', latency: null });
+    this.videoHidden = false;
+    this.publish({ controlling: false, ready: false, transport: '', latency: null, privacy: null, hostMuted: null, busy: false });
   }
 
   private fail(error: unknown): void {
@@ -246,6 +261,10 @@ export class WebDesktopController {
     this.publish({ ready: true, status });
     this.syncControl();
     this.applySettings();
+    // 拿到控制后按偏好打开隐私屏幕;失败只是少一层遮挡,不影响连接。
+    if (this.state.controlling && this.state.caps?.privacyScreen && this.state.preferences.privacyScreen && this.state.privacy !== true) {
+      void this.setPrivacy(true).catch(() => undefined);
+    }
   }
 
   selectDisplay(displayId: string): void {
@@ -264,6 +283,9 @@ export class WebDesktopController {
 
   preferences(patch: Partial<DesktopPreferences>): void {
     this.publish({ preferences: { ...this.state.preferences, ...patch } });
+    if (patch.privacyScreen !== undefined && this.state.controlling && this.state.caps?.privacyScreen) {
+      void this.setPrivacy(patch.privacyScreen).catch(() => undefined);
+    }
     if (patch.audio !== undefined) this.settings({ audio: patch.audio });
   }
 
@@ -278,6 +300,139 @@ export class WebDesktopController {
   fit(): void { this.runtime.receive({ type: 'fit' }); }
   actualSize(): void { this.runtime.receive({ type: 'actualSize' }); }
   releaseInput(): void { this.runtime.receive({ type: 'releaseInput' }); }
+
+  zoom(direction: 'in' | 'out'): void {
+    this.runtime.receive({ type: 'zoom', factor: direction === 'in' ? 1.25 : 0.8 });
+  }
+
+  /** 发一组组合键(按下再逆序抬起),用于浏览器自己会拦截的快捷键,如 Ctrl+Alt+Delete、Alt+Tab。 */
+  keys(codes: string[]): void {
+    if (!this.state.controlling) return;
+    const events: DesktopInput[] = [
+      ...codes.map((code) => ({ kind: 'key' as const, code, down: true })),
+      ...codes.slice().reverse().map((code) => ({ kind: 'key' as const, code, down: false })),
+    ];
+    this.runtime.receive({ type: 'events', events });
+  }
+
+  private requireLease() {
+    const lease = this.session.lease;
+    if (!lease || !this.state.controlling) throw new Error('DESKTOP_VIEW_ONLY');
+    return lease;
+  }
+
+  /** 读远程电脑剪贴板里的文字。 */
+  async copyFromRemote(): Promise<string> {
+    const lease = this.requireLease();
+    this.releaseInput();
+    const result = await this.request<{ text?: unknown }>({ op: 'clipboard', lease: lease.lease, action: 'copy' });
+    if (typeof result?.text !== 'string' || !result.text) throw new Error('CLIPBOARD_EMPTY');
+    if (result.text.length > REMOTE_DESKTOP_MAX_CLIPBOARD_CHARS) throw new Error('CLIPBOARD_TOO_LONG');
+    return result.text;
+  }
+
+  /** 把文字放进远程电脑的剪贴板(之后在远程电脑上粘贴)。 */
+  async pasteToRemote(text: string): Promise<void> {
+    const lease = this.requireLease();
+    if (!text) throw new Error('CLIPBOARD_EMPTY');
+    if (text.length > REMOTE_DESKTOP_MAX_CLIPBOARD_CHARS) throw new Error('CLIPBOARD_TOO_LONG');
+    this.releaseInput();
+    await this.request({ op: 'clipboard', lease: lease.lease, action: 'paste', text });
+  }
+
+  async displayModes(): Promise<RemoteDesktopDisplayMode[]> {
+    const lease = this.session.lease;
+    if (!lease || !this.state.caps?.displayModes) return [];
+    const modes = await this.request<RemoteDesktopDisplayMode[]>({ op: 'displayModes', lease: lease.lease });
+    return Array.isArray(modes) ? modes : [];
+  }
+
+  /** 切换远程显示器分辨率(断开时电脑会恢复原分辨率)。能保留视频流时只改几何,否则重建视频。 */
+  async resolution(mode: RemoteDesktopDisplayMode): Promise<void> {
+    const lease = this.requireLease();
+    const caps = this.state.caps;
+    if (!caps?.resolutionRestore || this.state.busy) throw new Error('DESKTOP_DISPLAY_MODES_UNAVAILABLE');
+    const keepVideo = caps.liveDisplaySwitch === true;
+    this.publish({ busy: true });
+    if (!keepVideo) this.media.reset();
+    try {
+      const next = await this.session.fitDisplay(mode.width, mode.height, true, mode.id, keepVideo, caps.autoControl === true);
+      if (this.session.lease !== lease) return;
+      const geometry = { width: next.display.width, height: next.display.height, restore: true };
+      if (next.videoKept) this.runtime.receive({ type: 'displayGeometry', ...geometry });
+      else {
+        if (keepVideo) this.media.reset();
+        this.streaming = false;
+        this.runtime.receive({ type: 'videoSettings', ...geometry, audio: this.state.settings.audio && caps.systemAudio === true });
+      }
+      if (!next.controlling) await this.session.control(true);
+    } catch (error) {
+      if (error instanceof Error && error.message === 'INVOKE_TIMEOUT') this.fail(error);
+      throw error;
+    } finally {
+      if (this.session.lease === lease) {
+        this.publish({ busy: false });
+        this.syncControl();
+      }
+    }
+  }
+
+  /** 隐私屏幕:遮住被控电脑本地显示器,旁人看不到你在远程做什么。 */
+  async setPrivacy(enabled: boolean): Promise<void> {
+    const lease = this.requireLease();
+    await this.request({ op: 'privacyScreen', lease: lease.lease, enabled, lockOnExit: this.state.preferences.lockOnExit });
+    if (this.session.lease === lease) this.publish({ privacy: enabled });
+  }
+
+  async setHostMute(enabled: boolean): Promise<void> {
+    const lease = this.requireLease();
+    await this.request({ op: 'hostMute', lease: lease.lease, enabled });
+    if (this.session.lease === lease) this.publish({ hostMuted: enabled });
+  }
+
+  async listWindows(): Promise<RemoteDesktopWindow[]> {
+    const lease = this.requireLease();
+    const items = await this.request<RemoteDesktopWindow[]>({ op: 'windowAction', lease: lease.lease, action: 'list' });
+    return Array.isArray(items)
+      ? items.filter((item) => item && typeof item.id === 'string' && /^0x[a-f0-9]{1,16}$/.test(item.id)
+        && typeof item.title === 'string' && typeof item.app === 'string').slice(0, 256)
+      : [];
+  }
+
+  async activateWindow(id: string): Promise<void> {
+    const lease = this.requireLease();
+    await this.request({ op: 'windowAction', lease: lease.lease, action: 'activate', id });
+  }
+
+  async showDesktop(): Promise<void> {
+    const lease = this.requireLease();
+    await this.request({ op: 'windowAction', lease: lease.lease, action: 'desktop' });
+  }
+
+  /** 标签页切到后台时让被控电脑暂停发视频(保留声音、输入与租约),回来时恢复。 */
+  setHidden(hidden: boolean): void {
+    this.hidden = hidden;
+    void this.syncHidden();
+  }
+
+  private async syncHidden(): Promise<void> {
+    const lease = this.session.lease;
+    if (this.hiddenBusy || this.disposed || !lease || !this.streaming || !this.state.caps?.viewerHidden || this.hidden === this.videoHidden) return;
+    const hidden = this.hidden;
+    this.hiddenBusy = true;
+    let failed = false;
+    try {
+      await this.request({ op: 'viewerHidden', lease: lease.lease, hidden });
+    } catch {
+      failed = true;
+    } finally {
+      this.hiddenBusy = false;
+    }
+    this.videoHidden = hidden;
+    // 恢复可能没生效:重建视频,新的视频流总是从未暂停开始。
+    if (failed && !hidden && this.session.lease === lease) { this.pendingSettings = true; this.applySettings(); }
+    void this.syncHidden();
+  }
 
   /** 主动结束:释放租约;被控电脑按「退出时锁屏」策略处理。 */
   async close(): Promise<void> {
@@ -347,6 +502,8 @@ export class WebDesktopController {
         break;
       case 'streaming':
         this.streaming = true;
+        this.videoHidden = false;
+        void this.syncHidden();
         this.publish({ transport: 'video', latency: null });
         this.present('live');
         break;

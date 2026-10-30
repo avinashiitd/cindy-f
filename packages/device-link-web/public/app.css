@@ -172,3 +172,7 @@ textarea, input[type=text], input:not([type]) {
 .chat .side { flex: none; max-height: 45%; overflow-y: auto; }
 .btn { white-space: nowrap; }
 .task-list > .row.between { flex-wrap: wrap; row-gap: 4px; }
+.viewer-toolbar.secondary { padding-top: 4px; padding-bottom: 6px; }
+.viewer-notice { display: flex; align-items: center; gap: 8px; padding: 6px 12px; border-bottom: 1px solid var(--border); background: var(--surface); }
+.viewer-notice[hidden] { display: none; }
+.manual-copy { flex: 1; font: inherit; color: inherit; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; padding: 6px 8px; }
