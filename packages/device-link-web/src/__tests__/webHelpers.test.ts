@@ -4,12 +4,17 @@
  * - 规则依据:加入链接来自桌面端的 `cindy://relay/join?…`,网页也可能带 `#/join?…`;消息正文必须只作纯文本;
  *   浏览器的 `WebSocket.close` 对 1000/3000–4999 以外的关闭码会抛异常,而 DeviceLinkClient 会用 1001 等关闭。
  * - 现有覆盖缺口:端到端用例只走程序构造的链接和一条助手消息;这里补用户输入形态与异常关闭码。
+ * - 附件:引用必须能被电脑端用共享解析器读回(ossKey、大小、SHA-256);落库时图片与文件分开,图片字段名必须是 originalName。
  * - tier:unit,无网络。
  */
 import { buildRelayJoinLink, createRelayPairSecret, createRelaySigningKey } from '@cindy/device-link';
 import { nodeRelayAuthCrypto as crypto } from '@cindy/device-link/node-relay-crypto';
 import { describe, expect, it, vi } from 'vitest';
 
+import { createHash } from 'node:crypto';
+import { parseAttachmentOssRef } from '@cindy/device-link';
+
+import { buildWebAttachment, hashBlob, persistedRefs } from '../attachments';
 import { browserWsFactory } from '../connection';
 import { parseJoinInput } from '../join';
 import { toDisplayMessages } from '../messages';
@@ -68,5 +73,21 @@ describe('browser WebSocket adapter', () => {
     expect(FakeSocket.last.closed).toEqual([[], [4410, 'removed']]);
     expect(() => factory('wss://relay/x', { authorization: 'Bearer token' })).toThrow();
     vi.restoreAllMocks();
+  });
+});
+
+describe('attachments', () => {
+  it('hashes in chunks like a whole-file SHA-256 and builds references the host can parse', async () => {
+    const bytes = new Uint8Array(9 * 1024 * 1024).map((_, i) => i % 251);
+    const digest = await hashBlob(new Blob([bytes]));
+    expect(digest).toBe(createHash('sha256').update(bytes).digest('hex'));
+
+    const image = buildWebAttachment({ key: 'k1.png', name: 'C:\\shots\\screen.png', size: 10, sha256: digest, mimeType: 'image/png' });
+    const doc = buildWebAttachment({ key: 'k2.pdf', name: 'spec.pdf', size: 20, sha256: digest, mimeType: 'application/pdf' });
+    expect(parseAttachmentOssRef(image.path)).toMatchObject({ ossKey: 'k1.png', originalName: 'screen.png', size: 10, sha256: digest });
+    expect([image.category, image.url === image.path, doc.category, doc.url]).toEqual(['image', true, 'pdf', undefined]);
+    const refs = persistedRefs([image, doc]);
+    expect(refs.images).toEqual([{ url: image.path, originalName: 'screen.png', mimeType: 'image/png', size: 10, sha256: digest }]);
+    expect(refs.files).toEqual([{ name: 'spec.pdf', path: doc.path, size: 20, sha256: digest }]);
   });
 });

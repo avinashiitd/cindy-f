@@ -4,6 +4,7 @@
  */
 import { PROTOCOL_VERSION, type DeviceLinkClient, type DeviceView, type Envelope } from '@cindy/device-link';
 
+import { buildWebAttachment, extOf, hashBlob, persistedRefs, WEB_ATTACHMENT_MAX_BYTES, type WebAttachment } from './attachments';
 import type { RemoteMessageRow } from './messages';
 import { WEB_APP_VERSION } from './join';
 
@@ -68,6 +69,15 @@ export class RemoteError extends Error {
 
 const LIST_LIMIT = 100;
 const ONLINE_WAIT_MS = 15_000;
+const EXPORT_POLL_MS = 700;
+
+export interface RemoteDirEntry {
+  name: string;
+  relPath: string;
+  type: 'file' | 'directory';
+  size: number;
+  mtimeMs: number;
+}
 
 /** 这个浏览器作为控制端对被控端声明的信息。不声明任何可选能力,被控端按最保守的旧格式回复。 */
 function controllerInfo(deviceName: string) {
@@ -161,19 +171,25 @@ export class RemoteApi {
   }
 
   /** 发送一条文字消息:格式与手机的 `buildQueuedTextMessage` 一致,被控端按它排队与落库。 */
-  sendText(deviceId: string, session: RemoteSessionRow, text: string, clientId: string, now = new Date()): Promise<unknown> {
+  sendText(deviceId: string, session: RemoteSessionRow, text: string, clientId: string, now = new Date(), attachments: readonly WebAttachment[] = []): Promise<unknown> {
     const trimmed = text.trim();
+    const refs = persistedRefs(attachments);
     const agentKind = session.agentKind === 'codex' || session.agentKind === 'pi' ? session.agentKind : 'claude-code';
     const workingDir = session.workingDir || '';
     const item = {
       clientId,
       text: trimmed,
-      persistedContent: JSON.stringify({ text: trimmed, images: [], files: [] }),
+      persistedContent: JSON.stringify({ text: trimmed, images: refs.images, files: refs.files }),
+      ...(attachments.length ? { files: [...attachments] } : {}),
       model: session.model,
       effort: session.effort || '',
       permissionMode: session.permissionMode,
       workingDir,
-      chatMessage: { clientId, role: 'user', content: trimmed, isStreaming: false, createdAt: now.toISOString() },
+      chatMessage: {
+        clientId, role: 'user', content: trimmed, isStreaming: false, createdAt: now.toISOString(),
+        ...(refs.images.length ? { images: refs.images } : {}),
+        ...(refs.files.length ? { files: refs.files } : {}),
+      },
       createOpts: {
         agentKind,
         workingDir,
@@ -230,6 +246,62 @@ export class RemoteApi {
       kind: 'plan_review', behavior: approved ? 'allow' : 'deny',
       editedPlan: approved ? plan : undefined, reason: approved ? undefined : reason,
     }]);
+  }
+
+  // ── 媒体(经自建中转的媒体存储)与远程文件 ────────────────────────────────────
+  private async relayJson<T>(path: string, body: unknown): Promise<T> {
+    const res = await this.fetchFn(`${this.baseUrl}/api/device-link${path}`, {
+      method: 'POST',
+      headers: { Authorization: `CindyRelay ${this.credential}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new RemoteError(res.status === 401 ? 'UNAUTHORIZED' : 'FAILED', `media request failed (${res.status})`);
+    return (await res.json()) as T;
+  }
+
+  /** 上传一个文件,返回可随消息发送的附件。 */
+  async uploadAttachment(file: Blob & { name?: string }, name = file.name ?? 'file'): Promise<WebAttachment> {
+    if (file.size <= 0) throw new RemoteError('EMPTY_FILE', 'file is empty');
+    if (file.size > WEB_ATTACHMENT_MAX_BYTES) throw new RemoteError('FILE_TOO_LARGE', 'file is too large');
+    const mimeType = file.type || 'application/octet-stream';
+    const digest = await hashBlob(file);
+    const { putUrl, key } = await this.relayJson<{ putUrl: string; key: string }>('/media/presign-put', {
+      size: file.size, contentType: mimeType, ext: extOf(name) || 'bin',
+    });
+    const put = await this.fetchFn(putUrl, { method: 'PUT', headers: { 'Content-Type': mimeType }, body: file });
+    if (!put.ok) throw new RemoteError('UPLOAD_FAILED', `upload failed (${put.status})`);
+    return buildWebAttachment({ key, name, size: file.size, sha256: digest, mimeType });
+  }
+
+  async mediaDownloadUrl(key: string): Promise<string> {
+    return (await this.relayJson<{ getUrl: string }>('/media/presign-get', { key })).getUrl;
+  }
+
+  fileOp<T>(deviceId: string, args: Record<string, unknown>): Promise<T> {
+    return this.invoke(deviceId, 'file-browser:remote-op', [args]);
+  }
+
+  listDir(deviceId: string, workdir: string, relPath: string): Promise<RemoteDirEntry[]> {
+    return this.fileOp(deviceId, { op: 'listDir', workdir, relPath });
+  }
+
+  readFile(deviceId: string, workdir: string, relPath: string): Promise<{ ok: true; data: { content: string; size: number; truncated?: boolean; contentEncoding?: string } } | { ok: false; code: string }> {
+    return this.fileOp(deviceId, { op: 'readFile', workdir, relPath });
+  }
+
+  /** 下载电脑上的文件:电脑先上传到中转的媒体存储,完成后返回下载地址。 */
+  async exportFile(deviceId: string, workdir: string, relPath: string, onProgress?: (uploaded: number, size: number) => void, signal?: AbortSignal): Promise<string> {
+    const start = await this.fileOp<{ ok: boolean; transferId?: string; message?: string }>(deviceId, { op: 'exportFileStart', workdir, relPath, maxBytes: 2 * 1024 ** 3 });
+    if (!start.ok || !start.transferId) throw new RemoteError('EXPORT_FAILED', start.message ?? 'export failed');
+    for (;;) {
+      if (signal?.aborted) throw new RemoteError('CANCELLED', 'cancelled');
+      const status = await this.fileOp<{ ok: boolean; state?: string; key?: string; message?: string; size?: number; uploaded?: number }>(
+        deviceId, { op: 'exportFileStatus', workdir, transferId: start.transferId });
+      if (!status.ok || status.state === 'error') throw new RemoteError('EXPORT_FAILED', status.message ?? 'export failed');
+      onProgress?.(status.uploaded ?? 0, status.size ?? 0);
+      if (status.state === 'done' && status.key) return this.mediaDownloadUrl(status.key);
+      await new Promise((resolve) => setTimeout(resolve, EXPORT_POLL_MS));
+    }
   }
 
   /** 被控端转发来的 push 事件(`maker:event`、`local-db:messages:created` 等)。 */

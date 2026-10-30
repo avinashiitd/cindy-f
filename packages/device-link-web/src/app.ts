@@ -13,6 +13,7 @@ import { renderMarkdown } from './markdown';
 import { toDisplayMessages, type RemoteMessageRow } from './messages';
 import { agentKindOf, findModelOption, modelKey, modelOptions, needsFullAccessConfirmation, PERMISSION_MODES } from './models';
 import { clearProfile, loadProfile, saveProfile, type WebRelayProfile } from './profile';
+import type { WebAttachment } from './attachments';
 import { RemoteApi, RemoteError, type AgentKindName, type PendingInteraction, type ProviderLike, type RemoteSessionRow } from './remote';
 import { DEFAULT_DESKTOP_PREFERENCES, WebDesktopController, type DesktopPreferences, type DesktopSnapshot } from './desktop';
 
@@ -227,7 +228,7 @@ export function mountApp(root: HTMLElement): void {
   }
 
   // ── 工作区:左侧电脑列表,右侧任务或远程桌面(桌面浏览器的宽屏布局)─────────────
-  type Mode = 'tasks' | 'desktop';
+  type Mode = 'tasks' | 'desktop' | 'files';
   let selected: { deviceId: string; mode: Mode } | null = null;
   let pane: { dispose(): void } | null = null;
 
@@ -256,6 +257,7 @@ export function mountApp(root: HTMLElement): void {
                 h('span', { class: 'sub' }, device.online ? (device.remoteControlEnabled ? [device.platform, device.appVersion].filter(Boolean).join(' · ') : t.controlOff) : t.offline))),
             active ? h('div', { class: 'tabs', role: 'tablist' },
               h('button', { class: `tab${selected?.mode === 'tasks' ? ' on' : ''}`, role: 'tab', onclick: () => openDevice(device.deviceId, 'tasks') }, t.tabTasks),
+              h('button', { class: `tab${selected?.mode === 'files' ? ' on' : ''}`, role: 'tab', onclick: () => openDevice(device.deviceId, 'files') }, t.tabFiles),
               h('button', { class: `tab${selected?.mode === 'desktop' ? ' on' : ''}`, role: 'tab', onclick: () => openDevice(device.deviceId, 'desktop') }, t.tabDesktop)) : null);
         }));
     };
@@ -268,8 +270,8 @@ export function mountApp(root: HTMLElement): void {
       pane = null;
       selected = { deviceId, mode };
       paintSidebar();
-      pane = mode === 'tasks'
-        ? mountTasks(main, device)
+      pane = mode === 'tasks' ? mountTasks(main, device)
+        : mode === 'files' ? mountFiles(main, device)
         : mountDesktop(main, device);
     };
 
@@ -418,6 +420,30 @@ export function mountApp(root: HTMLElement): void {
 
     const input = h('textarea', { class: 'composer', rows: 2, placeholder: t.placeholder });
     const log = h('div', { class: 'log', role: 'log' });
+    // 附件:先上传到中转,发送时随消息带上;上传中的不能发送。
+    const attached: Array<{ id: number; name: string; attachment?: WebAttachment; error?: string }> = [];
+    let attachSeq = 0;
+    const chips = h('div', { class: 'chips' });
+    const paintChips = () => replaceChildren(chips, ...attached.map((item) => h('span', { class: `chip${item.error ? ' error' : ''}` },
+      item.error ? `${item.name} — ${item.error}` : item.attachment ? item.name : `${item.name} · ${t.attachUploading}`,
+      h('button', { class: 'chip-x', 'aria-label': '×', onclick: () => { attached.splice(attached.indexOf(item), 1); paintChips(); } }, '×'))));
+    const addFiles = (files: Iterable<File>) => {
+      for (const file of files) {
+        const item: (typeof attached)[number] = { id: ++attachSeq, name: file.name || 'file' };
+        attached.push(item);
+        void api?.uploadAttachment(file, item.name)
+          .then((attachment) => { item.attachment = attachment; })
+          .catch((e) => { item.error = e instanceof RemoteError && e.code === 'FILE_TOO_LARGE' ? t.attachTooLarge : t.attachFailed + (e instanceof Error ? e.message : ''); })
+          .finally(paintChips);
+      }
+      paintChips();
+    };
+    const filePicker = h('input', { type: 'file', multiple: true, hidden: true });
+    filePicker.addEventListener('change', () => { if (filePicker.files) addFiles(filePicker.files); filePicker.value = ''; });
+    input.addEventListener('paste', (event) => {
+      const files = [...(event.clipboardData?.files ?? [])];
+      if (files.length) { event.preventDefault(); addFiles(files); }
+    });
     const side = h('div', { class: 'side' });
     const runBadge = h('span', { class: 'pill ok' }, t.running);
     const stopButton = h('button', { class: 'btn', onclick: () => api && void api.stop(device.deviceId, session.id).then(load, load) }, t.stop);
@@ -533,9 +559,15 @@ export function mountApp(root: HTMLElement): void {
     };
     const send = async () => {
       const text = input.value.trim();
-      if (!text || sending || !api) return;
+      const ready = attached.filter((item) => item.attachment).map((item) => item.attachment!);
+      const uploading = attached.some((item) => !item.attachment && !item.error);
+      if ((!text && !ready.length) || uploading || sending || !api) return;
       sending = true;
-      try { await api.sendText(device.deviceId, session, text, newClientId()); input.value = ''; error = ''; }
+      try {
+        await api.sendText(device.deviceId, session, text, newClientId(), new Date(), ready);
+        input.value = ''; error = '';
+        attached.length = 0; paintChips();
+      }
       catch (e) { error = t.sendFailed + (e instanceof Error ? e.message : ''); }
       sending = false;
       await load();
@@ -550,7 +582,8 @@ export function mountApp(root: HTMLElement): void {
             ? h('span', { class: 'pill muted tool' }, `${t.tool}: ${message.text}${message.detail ? ` · ${message.detail}` : ''}`)
             : message.kind === 'assistant'
               ? h('div', { class: 'bubble md' }, renderMarkdown(message.text))
-              : h('div', { class: 'bubble' }, message.text))));
+              : h('div', { class: 'bubble' }, message.text,
+                ...(message.attachments ?? []).map((name) => h('span', { class: 'attached' }, `📎 ${name}`))))));
       if (stick) log.scrollTop = log.scrollHeight;
       replaceChildren(side,
         ...interactions.map((item) => {
@@ -578,10 +611,19 @@ export function mountApp(root: HTMLElement): void {
       if (event.from !== device.deviceId) return;
       if (event.channel.startsWith('maker:') || event.channel.startsWith('local-db:messages:') || event.channel.startsWith('local-db:sessions:')) schedule();
     });
-    replaceChildren(container, h('div', { class: 'chat' },
+    const chatEl = h('div', { class: 'chat' },
       h('div', { class: 'row between' }, titleEl, h('div', { class: 'row' }, runBadge, stopButton)),
-      controls, log, side,
-      h('div', { class: 'row composer-row' }, input, h('button', { class: 'btn primary', onclick: () => void send() }, t.send))));
+      controls, log, side, chips,
+      h('div', { class: 'row composer-row' },
+        h('button', { class: 'btn ghost', onclick: () => filePicker.click(), 'aria-label': t.attach, title: t.attach }, '📎'), filePicker,
+        input, h('button', { class: 'btn primary', onclick: () => void send() }, t.send)));
+    chatEl.addEventListener('dragover', (event) => { if (event.dataTransfer?.types.includes('Files')) { event.preventDefault(); chatEl.classList.add('dropping'); } });
+    chatEl.addEventListener('dragleave', () => chatEl.classList.remove('dropping'));
+    chatEl.addEventListener('drop', (event) => {
+      chatEl.classList.remove('dropping');
+      if (event.dataTransfer?.files.length) { event.preventDefault(); addFiles(event.dataTransfer.files); }
+    });
+    replaceChildren(container, chatEl);
     paint();
     void (async () => {
       try { await api?.openLink(device.deviceId); await api?.subscribe(device.deviceId, [topic]); }
@@ -594,6 +636,94 @@ export function mountApp(root: HTMLElement): void {
         void api?.unsubscribe(device.deviceId, [topic]).catch(() => undefined);
       },
     };
+  }
+
+  // ── 文件:浏览电脑上某个目录,预览文本,下载任意文件 ───────────────────────────────
+  function mountFiles(container: HTMLElement, device: DeviceView): { dispose(): void } {
+    let alive = true;
+    let workdir = '';
+    let relPath = '';
+    let entries: Array<{ name: string; relPath: string; type: 'file' | 'directory'; size: number; mtimeMs: number }> = [];
+    let selectedFile: string | null = null;
+    let download: AbortController | null = null;
+    const folder = h('input', { type: 'text', list: 'files-folders', placeholder: t.filesPickFolder, spellcheck: false, autocomplete: 'off' });
+    const datalist = h('datalist', { id: 'files-folders' });
+    const listEl = h('div', { class: 'file-list' });
+    const previewEl = h('div', { class: 'file-preview' }, h('p', { class: 'note empty' }, t.filesPickFolder));
+    const crumbs = h('div', { class: 'crumbs' });
+    replaceChildren(container, h('div', { class: 'files' },
+      h('div', { class: 'row files-bar' }, h('label', {}, t.filesFolder), folder, datalist,
+        h('button', { class: 'btn', onclick: () => { workdir = folder.value.trim(); relPath = ''; void openDir(); } }, t.filesOpen)),
+      crumbs, h('div', { class: 'split files-split' }, listEl, previewEl)));
+    folder.addEventListener('keydown', (e) => { if (e.key === 'Enter') { workdir = folder.value.trim(); relPath = ''; void openDir(); } });
+
+    const size = (bytes: number) => bytes < 1024 ? `${bytes} B` : bytes < 1024 ** 2 ? `${(bytes / 1024).toFixed(1)} KB` : `${(bytes / 1024 ** 2).toFixed(1)} MB`;
+    const paintCrumbs = () => {
+      const parts = relPath ? relPath.split('/') : [];
+      replaceChildren(crumbs,
+        h('button', { class: 'crumb', onclick: () => { relPath = ''; void openDir(); } }, workdir || '/'),
+        ...parts.map((part, i) => h('button', { class: 'crumb', onclick: () => { relPath = parts.slice(0, i + 1).join('/'); void openDir(); } }, `/ ${part}`)));
+    };
+    const paintList = (failed = false) => replaceChildren(listEl,
+      failed ? h('p', { class: 'note error' }, t.loadFailed) : null,
+      !failed && entries.length === 0 ? h('p', { class: 'note' }, t.filesEmpty) : null,
+      h('ul', { class: 'list' }, ...entries.map((entry) => h('li', {},
+        h('button', { class: `item file-item${entry.relPath === selectedFile ? ' active' : ''}`, onclick: () => entry.type === 'directory' ? (relPath = entry.relPath, void openDir()) : void openFile(entry) },
+          h('span', { class: 'item-main' }, h('strong', {}, `${entry.type === 'directory' ? '📁' : '📄'} ${entry.name}`)),
+          entry.type === 'file' ? h('span', { class: 'sub' }, size(entry.size)) : null)))));
+    const openDir = async () => {
+      if (!api || !workdir) return;
+      selectedFile = null;
+      paintCrumbs();
+      try {
+        const list = await api.listDir(device.deviceId, workdir, relPath);
+        entries = (Array.isArray(list) ? list : []).slice().sort((a, b) => Number(b.type === 'directory') - Number(a.type === 'directory') || a.name.localeCompare(b.name));
+        if (alive) paintList();
+      } catch { if (alive) { entries = []; paintList(true); } }
+    };
+    const startDownload = async (entry: { relPath: string; name: string }, status: HTMLElement) => {
+      if (!api) return;
+      download?.abort();
+      const controller = new AbortController();
+      download = controller;
+      status.textContent = t.filesPreparing;
+      try {
+        const url = await api.exportFile(device.deviceId, workdir, entry.relPath, (uploaded, total) => {
+          status.textContent = total ? `${t.filesPreparing} ${Math.floor((uploaded / total) * 100)}%` : t.filesPreparing;
+        }, controller.signal);
+        const a = h('a', { href: url, download: entry.name, rel: 'noopener' });
+        document.body.append(a);
+        a.click();
+        a.remove();
+        status.textContent = '';
+      } catch (e) {
+        if (!controller.signal.aborted) status.textContent = t.filesDownloadFailed + (e instanceof Error ? e.message : '');
+      }
+    };
+    const openFile = async (entry: { relPath: string; name: string; size: number }) => {
+      if (!api) return;
+      selectedFile = entry.relPath;
+      paintList();
+      const status = h('span', { class: 'sub' });
+      const head = h('div', { class: 'row between' }, h('strong', {}, entry.name),
+        h('div', { class: 'row' }, status, h('button', { class: 'btn', onclick: () => void startDownload(entry, status) }, t.filesDownload)));
+      replaceChildren(previewEl, head, h('p', { class: 'note' }, t.desktopConnecting));
+      try {
+        const result = await api.readFile(device.deviceId, workdir, entry.relPath);
+        if (!alive || selectedFile !== entry.relPath) return;
+        if (!result.ok || result.data.contentEncoding) { replaceChildren(previewEl, head, h('p', { class: 'note' }, t.filesBinary)); return; }
+        const pre = h('pre', { class: 'file-text' });
+        pre.textContent = result.data.content;
+        replaceChildren(previewEl, head, result.data.truncated ? h('p', { class: 'note' }, t.filesTruncated) : null,
+          entry.name.toLowerCase().endsWith('.md') ? h('div', { class: 'md file-md' }, renderMarkdown(result.data.content)) : pre);
+      } catch { if (alive) replaceChildren(previewEl, head, h('p', { class: 'note' }, t.filesBinary)); }
+    };
+    void api?.recentWorkdirs(device.deviceId).then((list) => {
+      if (!alive) return;
+      replaceChildren(datalist, ...list.slice(0, 30).map((w) => h('option', { value: w.path })));
+      if (list[0] && !folder.value) { folder.value = list[0].path; workdir = list[0].path; void openDir(); }
+    }).catch(() => undefined);
+    return { dispose() { alive = false; download?.abort(); } };
   }
 
   // ── 远程桌面 ────────────────────────────────────────────────────────────

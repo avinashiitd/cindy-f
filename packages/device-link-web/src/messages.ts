@@ -20,6 +20,8 @@ export interface DisplayMessage {
   text: string;
   /** 工具调用的一行摘要(命令、路径、网址等)。 */
   detail?: string;
+  /** 用户消息附带的图片 / 文件名。 */
+  attachments?: string[];
   createdAt: string;
 }
 
@@ -60,6 +62,20 @@ function contentText(content: unknown): string {
   return blocksText(record.content);
 }
 
+function attachmentNames(content: unknown): string[] {
+  const record = tryParseObject(content);
+  if (!record) return [];
+  const names: string[] = [];
+  for (const list of [record.images, record.files]) {
+    if (!Array.isArray(list)) continue;
+    for (const item of list) {
+      const name = item && typeof item === 'object' ? ((item as { originalName?: unknown; name?: unknown }).originalName ?? (item as { name?: unknown }).name) : null;
+      if (typeof name === 'string' && name.trim()) names.push(name.trim());
+    }
+  }
+  return names.slice(0, 20);
+}
+
 function toolDetail(content: unknown): string | undefined {
   const input = tryParseObject(tryParseObject(content)?.input);
   if (!input) return undefined;
@@ -87,7 +103,8 @@ export function toDisplayMessages(rows: readonly RemoteMessageRow[]): DisplayMes
     const key = row.id || row.clientId || `${row.createdAt}:${result.length}`;
     if (row.role === 'user' || row.role === 'assistant') {
       const text = contentText(row.content).trim();
-      if (text) result.push({ key, kind: row.role, text, createdAt: row.createdAt });
+      const attachments = row.role === 'user' ? attachmentNames(row.content) : [];
+      if (text || attachments.length) result.push({ key, kind: row.role, text, createdAt: row.createdAt, ...(attachments.length ? { attachments } : {}) });
     } else if (row.role === 'tool_use') {
       result.push({ key, kind: 'tool', text: toolName(row.content), detail: toolDetail(row.content), createdAt: row.createdAt });
     } else if (row.role === 'error' || row.role === 'system') {
