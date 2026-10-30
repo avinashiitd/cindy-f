@@ -20,6 +20,7 @@ const io = vi.hoisted(() => ({
   resumable: vi.fn(),
   cancel: vi.fn(async () => undefined),
   deleteAsync: vi.fn(async () => undefined),
+  writeBase64: vi.fn(async (uri: string, base64: string) => { io.sizes.set(uri, Math.floor(base64.length * 3 / 4)); }),
   progress: (_value: { totalBytesWritten: number; totalBytesExpectedToWrite?: number }) => {},
 }));
 
@@ -29,6 +30,8 @@ vi.mock('expo-file-system/legacy', () => ({
     return { downloadAsync: () => io.resumable(url, uri), cancelAsync: io.cancel };
   },
   deleteAsync: io.deleteAsync,
+  writeAsStringAsync: io.writeBase64,
+  EncodingType: { Base64: 'base64' },
 }));
 
 vi.mock('expo-file-system', () => ({
@@ -83,6 +86,7 @@ beforeEach(() => {
   io.resumable.mockReset().mockResolvedValue({ status: 200 });
   io.cancel.mockClear();
   io.deleteAsync.mockClear();
+  io.writeBase64.mockClear();
 });
 
 describe('versioned cache with the Expo adapter', () => {
@@ -120,6 +124,14 @@ describe('versioned cache with the Expo adapter', () => {
 });
 
 describe('bounded temporary media downloads', () => {
+  // Unit regression #8085: playable data-video payloads above the small inline
+  // file limit must be saved through native Base64 IO, without a JS byte copy.
+  it('saves a data-video larger than 1 MiB with native decoding', async () => {
+    const encoded = 'AAAA'.repeat(400_000);
+    const uri = await downloadRemoteMediaShareTemp(`data:video/mp4;base64,${encoded}`, 'video/mp4', 'clip.mp4');
+    expect(uri).toMatch(/clip\.mp4$/);
+    expect(io.writeBase64).toHaveBeenCalledExactlyOnceWith(uri, encoded, { encoding: 'base64' });
+  });
   // Tier 1: video export uses the existing cancellable transfer, including its
   // native byte counts; mocked button tests cannot verify the adapter wiring.
   it('forwards native progress and cancels an unfinished video export', async () => {

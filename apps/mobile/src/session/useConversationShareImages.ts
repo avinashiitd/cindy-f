@@ -54,31 +54,55 @@ async function loadShareVideoCover(
     import("expo-image-manipulator").ImageManipulatorContext | undefined;
   let image: import("expo-image-manipulator").ImageRef | undefined;
   let savedUri: string | undefined;
+  const deleteSavedFile = (uri: string) => {
+    try { new File(uri).delete(); } catch { /* OS cache cleanup */ }
+  };
+  const release = () => {
+    const resources = [image, context, thumbnail, player];
+    image = undefined; context = undefined; thumbnail = undefined; player = undefined;
+    for (const resource of resources) {
+      try { resource?.release(); } catch { /* Already disposed by native cancellation. */ }
+    }
+    const releaseFile = releaseSource;
+    releaseSource = undefined;
+    releaseFile?.();
+    if (savedUri) { deleteSavedFile(savedUri); savedUri = undefined; }
+  };
+  // Adopt a native result before completing the await. Cancellation owns all
+  // adopted resources; results arriving after it are disposed without adoption.
+  const take = <T,>(read: () => Promise<T>, adopt: (value: T) => void, discard: (value: T) => void) =>
+    readWithShareImageCancellation(() => read().then(value => {
+      if (signal.aborted) discard(value);
+      else adopt(value);
+    }), signal);
+  signal.addEventListener("abort", release, { once: true });
   try {
     const { createVideoPlayer } = await import("expo-video");
     const { ImageManipulator, SaveFormat } =
       await import("expo-image-manipulator");
     if (!canRead()) return null;
-    player = createVideoPlayer(null);
-    player.muted = true;
-    await player.replaceAsync(uri);
+    const currentPlayer = player = createVideoPlayer(null);
+    currentPlayer.muted = true;
+    await readWithShareImageCancellation(() => currentPlayer.replaceAsync(uri), signal);
     if (!canRead()) return null;
-    [thumbnail] = await player.generateThumbnailsAsync([0], {
+    await take(() => currentPlayer.generateThumbnailsAsync([0], {
       maxWidth: 1024,
       maxHeight: 1024,
-    });
+    }), frames => { [thumbnail] = frames; }, frames => frames.forEach(frame => frame.release()));
     if (!thumbnail || !canRead()) return null;
-    context = ImageManipulator.manipulate(thumbnail);
-    image = await context.renderAsync();
-    if (!canRead()) return null;
-    const saved = await image.saveAsync({
+    const currentContext = context = ImageManipulator.manipulate(thumbnail);
+    await take(() => currentContext.renderAsync(), value => { image = value; }, value => value.release());
+    if (!image || !canRead()) return null;
+    let saved: import("expo-image-manipulator").ImageResult | undefined;
+    const currentImage = image;
+    await take(() => currentImage.saveAsync({
       format: SaveFormat.JPEG,
       compress: 0.85,
       base64: true,
-    });
-    savedUri = saved.uri;
+    }), value => { saved = value; savedUri = value.uri; }, value => deleteSavedFile(value.uri));
     if (
       !canRead() ||
+      !saved ||
       !saved.base64 ||
       saved.base64.length > (MAX_IMAGE_BYTES * 4) / 3
     )
@@ -89,18 +113,8 @@ async function loadShareVideoCover(
       height: saved.height,
     };
   } finally {
-    if (savedUri) {
-      try {
-        new File(savedUri).delete();
-      } catch {
-        /* OS cache cleanup */
-      }
-    }
-    image?.release();
-    context?.release();
-    thumbnail?.release();
-    player?.release();
-    releaseSource?.();
+    signal.removeEventListener("abort", release);
+    release();
   }
 }
 

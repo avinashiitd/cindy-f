@@ -142,8 +142,8 @@ export function conversationShareReadableBody(
 export function conversationShareVideoSources(
   message: ConversationShareMessage,
   source: string,
-): Set<string> {
-  const sources = new Set<string>();
+): string[] {
+  const sources: string[] = [];
   if (message.kind !== "assistant") return sources;
   for (const part of splitRichAnswer(source)) {
     if (part.kind !== "rich") continue;
@@ -154,7 +154,7 @@ export function conversationShareVideoSources(
     const visit = (id: string) => {
       const node = doc.nodes.get(id);
       if (!node) return;
-      if (node.kind === "video") sources.add(richString(node, "src"));
+      if (node.kind === "video") sources.push(richString(node, "src"));
       children(node).forEach(visit);
     };
     doc.roots.forEach(visit);

@@ -41,7 +41,9 @@ export function VideoDownloadButton({ source, mimeType, active = true, immersive
     setProgress('');
     const meter = createTransferProgressMeter();
     const inferred = shareMimeForFileName(source.split(/[?#]/, 1)[0]);
+    const inlineMime = /^data:(video\/[\w.+-]+);/i.exec(source)?.[1].toLowerCase();
     const mime = mimeType?.split(';', 1)[0].trim().toLowerCase()
+      || inlineMime
       || (inferred.startsWith('video/') ? inferred : 'video/mp4');
     const ext = mime === 'video/x-m4v' ? 'm4v' : extOfMime(mime);
     try {

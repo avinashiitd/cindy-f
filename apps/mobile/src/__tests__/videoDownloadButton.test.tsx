@@ -39,6 +39,13 @@ it('exports a local copy with the video format and disables unresolved media', a
   expect(h.download).toHaveBeenCalledWith('file:///clip.mov', 'video/quicktime', 'video.mov', expect.any(AbortSignal), expect.any(Function));
   expect(h.share).toHaveBeenCalledWith('file:///share/video.mov', { mimeType: 'video/quicktime' });
 });
+// Unit #8085: a data URL has no filename extension; retain its declared video
+// MIME so the OS receives a playable MOV rather than a mislabeled MP4.
+it('preserves the MIME and extension declared by a data-video source', async () => {
+  render('data:video/quicktime;base64,AAAA'); await click();
+  expect(h.download).toHaveBeenCalledWith('data:video/quicktime;base64,AAAA', 'video/quicktime', 'video.mov', expect.any(AbortSignal), expect.any(Function));
+  expect(h.share).toHaveBeenCalledWith('file:///share/video.mov', { mimeType: 'video/quicktime' });
+});
 it.each(['hidden', 'source', 'account', 'blur', 'unmount'])('cancels %s exports and ignores late completion', async reason => {
   let finish!: (uri: string) => void;
   h.download.mockImplementation(() => new Promise(r => { finish = r; }));

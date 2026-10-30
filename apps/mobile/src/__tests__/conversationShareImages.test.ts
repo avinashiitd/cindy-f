@@ -12,6 +12,26 @@ const image = {
 };
 
 describe("conversation share images", () => {
+  // Unit regression #8085: image Markdown parsing drops the supported xdt-video
+  // scheme. A visible legacy video must reach the video decoder directly.
+  it("loads legacy video sources without the image protocol whitelist", async () => {
+    const url = "xdt-video://open?path=%2Fwork%2Fclip.mp4";
+    const body = "```cindy-ui\n" + JSON.stringify({ version: 1, seq: 1, op: "create", id: "v", kind: "video", props: { src: url } }) + "\n```";
+    const load = vi.fn(async () => image);
+    const [message] = await prepareConversationShareImages([{ clientId: "v", kind: "assistant", body }], load);
+    expect(load).toHaveBeenCalledExactlyOnceWith(url, "video");
+    expect(message?.images?.get(url)).toEqual(image);
+  });
+  // Unit: repeated video frames consume the same per-occurrence bitmap budget
+  // as images, even though their decoder request is deduplicated by URL.
+  it("charges every occurrence of a repeated video cover", async () => {
+    const url = "xdt-video://open?path=%2Fwork%2Fclip.mp4";
+    const body = "```cindy-ui\n" + [0, 1, 2].map(index => JSON.stringify({ version: 1, seq: index + 1, op: "create", id: `v${index}`, kind: "video", props: { src: url } })).join("\n") + "\n```";
+    const load = vi.fn(async () => ({ ...image, width: 2000, height: 2000 }));
+    const [message] = await prepareConversationShareImages([{ clientId: "v", kind: "assistant", body }], load);
+    expect(load).toHaveBeenCalledExactlyOnceWith(url, "video");
+    expect(message?.images?.size).toBe(0);
+  });
   // Unit regression: sharing a visible cindy-ui video used to export only its alt
   // text. Exercise preparation and both real exporters, including hidden tabs.
   it.each([lightColors, darkColors])(

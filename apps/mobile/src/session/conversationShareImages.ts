@@ -6,6 +6,7 @@ import {
   collectMobileMarkdownImages,
   mobileMarkdownImageUrlForWorkdir,
 } from "@/session/messageMarkdown";
+import { isDirectPreviewableMediaUrl } from "./remoteMedia";
 import type {
   ConversationShareImage,
   ConversationShareMessage,
@@ -69,9 +70,20 @@ export async function prepareConversationShareImages(
     if (message.secondaryBody) texts.push(message.secondaryBody);
     for (const text of texts) {
       const videos = conversationShareVideoSources(message, text);
+      for (const source of videos) {
+        const url = isDirectPreviewableMediaUrl(source) || /^xdt-video:\/\//i.test(source)
+          ? source
+          : mobileMarkdownImageUrlForWorkdir(source, context.workdir, message.clientId, context.remoteHostId, context.sessionId);
+        if (url) {
+          addSource(source, url);
+          videoUrls.add(url);
+        }
+      }
       for (const image of collectMobileMarkdownImages(
         conversationShareReadableBody(message, text),
       )) {
+        // Rich videos are collected from their visible nodes, not image syntax.
+        if (videos.includes(image.url)) continue;
         const url = mobileMarkdownImageUrlForWorkdir(
           image.url,
           context.workdir,
@@ -81,7 +93,6 @@ export async function prepareConversationShareImages(
         );
         if (url) {
           addSource(image.url, url);
-          if (videos.has(image.url)) videoUrls.add(url);
         }
       }
     }

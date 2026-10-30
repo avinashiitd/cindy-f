@@ -16,6 +16,7 @@ vi.mock("react-native", () => ({
 const video = vi.hoisted(() => ({
   replace: vi.fn(async (_uri: string) => undefined),
   frames: vi.fn(),
+  render: vi.fn(),
   release: vi.fn(),
   releaseFrame: vi.fn(),
   releaseContext: vi.fn(),
@@ -34,10 +35,7 @@ vi.mock("expo-image-manipulator", () => ({
   SaveFormat: { JPEG: "jpeg" },
   ImageManipulator: {
     manipulate: () => ({
-      renderAsync: async () => ({
-        saveAsync: video.save,
-        release: video.releaseImage,
-      }),
+      renderAsync: video.render,
       release: video.releaseContext,
     }),
   },
@@ -121,6 +119,7 @@ const media = {
   previewable: true,
 };
 beforeEach(() => {
+  video.render.mockReset().mockImplementation(async () => ({ saveAsync: video.save, release: video.releaseImage }));
   vi.mocked(Image.getSize).mockReset().mockImplementation(async (uri) => {
     if (!uri.startsWith("file://")) {
       throw new Error("Unsupported uri scheme for encoded image fetch!");
@@ -132,6 +131,7 @@ beforeEach(() => {
 afterEach(async () => {
   await act(async () => root.unmount());
   vi.useRealTimers();
+  video.replace.mockImplementation(async () => undefined);
   thumbs.entries.clear();
   thumbs.reads.mockClear();
   thumbs.writes.mockReset();
@@ -141,6 +141,37 @@ afterEach(async () => {
 });
 
 describe("share image readiness", () => {
+  // Unit regression #8085: cancellation must free the native player/source
+  // before a hung replace/thumbnail promise settles, and discard late frames.
+  it.each(["replace", "thumbnail", "render", "save"])("releases a pending native %s on cancel", async (stage) => {
+    Object.values(video).forEach((mock) => mock.mockClear());
+    let finish!: (value?: any) => void;
+    const pending = new Promise<any>((resolve) => { finish = resolve; });
+    video.replace.mockImplementation(() => stage === "replace" ? pending : Promise.resolve());
+    video.frames.mockImplementation(() => stage === "thumbnail" ? pending : Promise.resolve([{ release: video.releaseFrame }]));
+    if (stage === "render") video.render.mockImplementation(() => pending);
+    video.save.mockImplementation(() => pending);
+    const url = "cindy-media://blobs/cancel.mp4";
+    const message: ConversationShareMessage = { clientId: "cancel-video", kind: "assistant", body: "```cindy-ui\n" + JSON.stringify({ version: 1, seq: 1, op: "create", id: "v", kind: "video", props: { src: url } }) + "\n```" };
+    const resolve = vi.fn<ResolveRemoteMediaFn>(async () => ({ ...media, url: "file:///app/cache/cancel.mp4", mimeType: "video/mp4", protectLocalFile: () => video.releaseSource }));
+    await act(async () => root.render(createElement(Probe, { messages: [message], resolve })));
+    await startShare();
+    const waitFor = { replace: video.replace, thumbnail: video.frames, render: video.render, save: video.save }[stage]!;
+    await act(async () => { await vi.waitFor(() => expect(waitFor).toHaveBeenCalled()); });
+    await act(async () => current.cancel());
+    expect(video.release).toHaveBeenCalledOnce();
+    expect(video.releaseSource).toHaveBeenCalledOnce();
+    expect(await ready).toEqual([]);
+    const lateValue = stage === "thumbnail" ? [{ release: video.releaseFrame }]
+      : stage === "render" ? { release: video.releaseImage, saveAsync: video.save }
+      : stage === "save" ? { uri: "file:///app/cache/late-cover.jpg", base64: "bGF0ZQ==" } : undefined;
+    await act(async () => finish(lateValue));
+    expect(video.releaseFrame).toHaveBeenCalledTimes(stage === "replace" ? 0 : 1);
+    expect(video.releaseImage).toHaveBeenCalledTimes(stage === "render" || stage === "save" ? 1 : 0);
+    if (stage === "save") expect(thumbs.deletes).toHaveBeenCalledWith("file:///app/cache/late-cover.jpg");
+    else expect(video.save).not.toHaveBeenCalled();
+    expect(video.release).toHaveBeenCalledOnce();
+  });
   // Unit regression: video nodes were sent to the image decoder, so exports
   // lost their cover. Existing image tests cannot exercise native frame leases.
   it.each(["ready", "cancel", "decode-error"])(
